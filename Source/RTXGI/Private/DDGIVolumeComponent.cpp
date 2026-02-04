@@ -1351,26 +1351,33 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 			{
 				FMemMark Mark(FMemStack::Get());
 				FRDGBuilder GraphBuilder(RHICmdList);
-
-				bool needReallocate =
-					DDGIProxy->ComponentData.ProbeCounts != ComponentData.ProbeCounts ||
-					DDGIProxy->ComponentData.RaysPerProbe != ComponentData.RaysPerProbe ||
-					DDGIProxy->ComponentData.EnableProbeRelocation != ComponentData.EnableProbeRelocation;
-
-				// set the data
+		
+				// Compute changes BEFORE assigning ComponentData
+				bool probeCountsChanged = DDGIProxy->ComponentData.ProbeCounts != ComponentData.ProbeCounts;
+				bool raysPerProbeChanged = DDGIProxy->ComponentData.RaysPerProbe != ComponentData.RaysPerProbe;
+				bool relocationChanged = DDGIProxy->ComponentData.EnableProbeRelocation != ComponentData.EnableProbeRelocation;
+		
+				bool needReallocate = probeCountsChanged || raysPerProbeChanged || relocationChanged;
+		
+				// Now assign the new data
 				DDGIProxy->ComponentData = ComponentData;
-
-				// handle state textures ready to load from serialization
+		
+				// Handle state textures ready to load from serialization
 				if (TextureLoadContext.ReadyForLoad)
 					DDGIProxy->TextureLoadContext = TextureLoadContext;
-
+		
 				if (needReallocate)
 				{
+					// Clear load context if reallocating due to probe count change (old data incompatible)
+					if (probeCountsChanged)
+					{
+						DDGIProxy->TextureLoadContext.Clear();
+					}
 					DDGIProxy->ReallocateSurfaces_RenderThread(RHICmdList, IrradianceBits, DistanceBits);
 					DDGIProxy->ResetTextures_RenderThread(GraphBuilder);
 					FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Add(DDGIProxy);
 				}
-
+		
 				GraphBuilder.Execute();
 			}
 		);

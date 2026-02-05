@@ -667,7 +667,7 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 		int32 numVolumes = FMath::Min(volumes.Num(), FDDGIVolumeSceneProxy::FComponentData::c_RTXGI_DDGI_MAX_SHADING_VOLUMES);
 
 		// Truncate the in-frustum volumes list to the maximum number of volumes supported
-		volumes.SetNum(numVolumes, true);
+		volumes.SetNum(numVolumes, EAllowShrinking::Yes);
 
 		// Sort the final volume list by descending probe density
 		Algo::Sort(volumes, [](const FProxyEntry& A, const FProxyEntry& B)
@@ -901,7 +901,7 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 	SET_FLOAT_STAT(SAMPLES_PER_MILLI, samplesPerMilli);
 
 	//GPU Timing code from UnrealEdMisc.cpp
-	uint32 GPUCycles = GraphBuilder.RHICmdList.GetGPUFrameCycles();
+	uint32 GPUCycles = RHIGetGPUFrameCycles();
 	double RawGPUFrameTime = FPlatformTime::ToMilliseconds(GPUCycles);
 
 	float totalGpuTime = RawGPUFrameTime;

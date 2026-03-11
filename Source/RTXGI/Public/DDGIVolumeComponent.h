@@ -512,7 +512,7 @@ public:
 
 	FIntVector PrevProbeScrollOffsets;
 
-	FIntVector PrevProbeCounts = FIntVector(0);
+	FIntVector PrevProbeCounts = FIntVector(8,8,8);
 
 #if ENGINE_MAJOR_VERSION < 5
 	FVector LastOrigin = FVector{ 0.0f, 0.0f, 0.0f };

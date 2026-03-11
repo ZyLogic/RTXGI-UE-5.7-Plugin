@@ -83,19 +83,13 @@ static TAutoConsoleVariable<float> CVarDDGIIrradianceScalar(
 	ECVF_RenderThreadSafe);
 #endif
 
-#if WITH_EDITOR
-static TAutoConsoleVariable<bool> CVarDDGIStaticInEditor(
-	TEXT("r.RTXGI.DDGI.StaticInEditor"),
-	true,
-	TEXT("If true, will not update DDGI volumes in editor views\n"),
-	ECVF_RenderThreadSafe);
-#endif
-
-static TAutoConsoleVariable<bool> CVarDDGIForceRealtime(
-	TEXT("r.RTXGI.DDGI.ForceRealtime"),
+static TAutoConsoleVariable<bool> CVarDDGIStatic(
+	TEXT("r.RTXGI.DDGI.EnableStatic"),
 	false,
-	TEXT("If true, will force DDGI volumes as realtime.\n"),
+	TEXT("If true all DDGI volumes are running static"),
 	ECVF_RenderThreadSafe);
+
+
 #if !RHI_RAYTRACING
 #error "RTXGI requires RHI_RAYTRACING to be enabled"
 #endif
@@ -139,11 +133,28 @@ static FMatrix44f ComputeRandomRotation()
 	float _33 = 1.f - 2.f * u3;
 
 	return FMatrix44f(
-		FPlane4f( _11, _12, _13, 0.f ),
-		FPlane4f(_21, _22, _23, 0.f ),
-		FPlane4f(_31, _32, _33, 0.f ),
-		FPlane4f(0.f, 0.f, 0.f, 1.f )
+		FPlane4f(_11, _12, _13, 0.f),
+		FPlane4f(_21, _22, _23, 0.f),
+		FPlane4f(_31, _32, _33, 0.f),
+		FPlane4f(0.f, 0.f, 0.f, 1.f)
 	);
+}
+
+// Helper: build a bounded FRHICopyTextureInfo clamped to the minimum of source and dest dimensions.
+// This prevents D3D12 asserts when pool-bucketed textures or stale saved data have mismatched sizes.
+static FRHICopyTextureInfo MakeBoundedCopyInfo(FRHITexture* Src, FRHITexture* Dst)
+{
+	FRHICopyTextureInfo Info{};
+	if (Src && Dst)
+	{
+		const FIntVector SrcSize = Src->GetSizeXYZ();
+		const FIntVector DstSize = Dst->GetSizeXYZ();
+		Info.Size = FIntVector(
+			FMath::Min(SrcSize.X, DstSize.X),
+			FMath::Min(SrcSize.Y, DstSize.Y),
+			1);
+	}
+	return Info;
 }
 
 static void LoadVolumeTextures_RenderThread(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* proxy)
@@ -154,25 +165,33 @@ static void LoadVolumeTextures_RenderThread(FRDGBuilder& GraphBuilder, FDDGIVolu
 	if (proxy->TextureLoadContext.Irradiance.Texture)
 	{
 		TRefCountPtr<IPooledRenderTarget> IrradianceLoaded = CreateRenderTarget(proxy->TextureLoadContext.Irradiance.Texture.GetReference(), TEXT("DDGIIrradianceLoaded"));
-		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(IrradianceLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesIrradiance), FRHICopyTextureInfo{});
+		//AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(IrradianceLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesIrradiance), FRHICopyTextureInfo{});
+		FRHICopyTextureInfo CopyInfo = MakeBoundedCopyInfo(IrradianceLoaded->GetRHI(), proxy->ProbesIrradiance->GetRHI());
+		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(IrradianceLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesIrradiance), CopyInfo);
 	}
 
 	if (proxy->TextureLoadContext.Distance.Texture)
 	{
 		TRefCountPtr<IPooledRenderTarget> DistanceLoaded = CreateRenderTarget(proxy->TextureLoadContext.Distance.Texture.GetReference(), TEXT("DDGIDistanceLoaded"));
-		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(DistanceLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesDistance), FRHICopyTextureInfo{});
+		//AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(DistanceLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesDistance), FRHICopyTextureInfo{});
+		FRHICopyTextureInfo CopyInfo = MakeBoundedCopyInfo(DistanceLoaded->GetRHI(), proxy->ProbesDistance->GetRHI());
+		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(DistanceLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesDistance), CopyInfo);
 	}
 
 	if (proxy->TextureLoadContext.Offsets.Texture && proxy->ProbesOffsets)
 	{
 		TRefCountPtr<IPooledRenderTarget> OffsetsLoaded = CreateRenderTarget(proxy->TextureLoadContext.Offsets.Texture.GetReference(), TEXT("DDGIOffsetsLoaded"));
-		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(OffsetsLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesOffsets), FRHICopyTextureInfo{});
+		//AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(OffsetsLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesOffsets), FRHICopyTextureInfo{});
+		FRHICopyTextureInfo CopyInfo = MakeBoundedCopyInfo(OffsetsLoaded->GetRHI(), proxy->ProbesOffsets->GetRHI());
+		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(OffsetsLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesOffsets), CopyInfo);
 	}
 
 	if (proxy->TextureLoadContext.States.Texture && proxy->ProbesStates)
 	{
 		TRefCountPtr<IPooledRenderTarget> StatesLoaded = CreateRenderTarget(proxy->TextureLoadContext.States.Texture.GetReference(), TEXT("DDGIStatesLoaded"));
-		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(StatesLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesStates), FRHICopyTextureInfo{});
+		//AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(StatesLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesStates), FRHICopyTextureInfo{});
+		FRHICopyTextureInfo CopyInfo = MakeBoundedCopyInfo(StatesLoaded->GetRHI(), proxy->ProbesStates->GetRHI());
+		AddCopyTexturePass(GraphBuilder, GraphBuilder.RegisterExternalTexture(StatesLoaded), GraphBuilder.RegisterExternalTexture(proxy->ProbesStates), CopyInfo);
 	}
 
 	proxy->TextureLoadContext.Clear();
@@ -182,8 +201,8 @@ class FRayTracingRTXGIProbeUpdateRGS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FRayTracingRTXGIProbeUpdateRGS)
 	SHADER_USE_ROOT_PARAMETER_STRUCT(FRayTracingRTXGIProbeUpdateRGS, FGlobalShader)
-	
-	class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY"); // If false, it will cull back face triangles. We want this on for probe relocation and to stop light leak.
+
+		class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY"); // If false, it will cull back face triangles. We want this on for probe relocation and to stop light leak.
 	class FEnableMaterialsDim : SHADER_PERMUTATION_BOOL("ENABLE_MATERIALS");                 // If false, forces the geo to opaque (no alpha test). We want this off for speed.
 	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
 	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
@@ -220,30 +239,37 @@ class FRayTracingRTXGIProbeUpdateRGS : public FGlobalShader
 	{
 		return ERayTracingPayloadType::RayTracingMaterial;
 	}
-	
+
+	static const FShaderBindingLayout* GetShaderBindingLayout(const FShaderPermutationParameters& Parameters)
+	{
+		return RayTracing::GetShaderBindingLayout(Parameters.Platform);
+	}
+
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-	SHADER_PARAMETER_RDG_BUFFER_SRV(RaytracingAccelerationStructure, TLAS)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RadianceOutput)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, DDGIProbeScrollSpace)
-	SHADER_PARAMETER(uint32, FrameRandomSeed)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DDGIVolume_ProbeIrradiance)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DDGIVolume_ProbeDistance)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DDGIVolume_ProbeOffsets)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, DDGIVolume_ProbeStates)
-	SHADER_PARAMETER_SAMPLER(SamplerState, DDGIVolume_LinearClampSampler)
-	SHADER_PARAMETER(FVector3f, DDGIVolume_Radius)
-	SHADER_PARAMETER(float, DDGIVolume_IrradianceScalar)
-	SHADER_PARAMETER(float, DDGIVolume_EmissiveMultiplier)
-	SHADER_PARAMETER(int, DDGIVolume_ProbeIndexStart)
-	SHADER_PARAMETER(int, DDGIVolume_ProbeIndexCount)
-	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FDDGIVolumeDescGPU, DDGIVolume)
-	SHADER_PARAMETER(FVector3f, Sky_Color)
-	SHADER_PARAMETER_TEXTURE(TextureCube, Sky_Texture)
-	SHADER_PARAMETER_SAMPLER(SamplerState, Sky_TextureSampler)
-	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
-	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FRayTracingLightGrid, RayTracingLightGridUniformBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(RaytracingAccelerationStructure, TLAS)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RadianceOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, DDGIProbeScrollSpace)
+		SHADER_PARAMETER(uint32, FrameRandomSeed)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DDGIVolume_ProbeIrradiance)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DDGIVolume_ProbeDistance)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DDGIVolume_ProbeOffsets)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, DDGIVolume_ProbeStates)
+		SHADER_PARAMETER_SAMPLER(SamplerState, DDGIVolume_LinearClampSampler)
+		SHADER_PARAMETER(FVector3f, DDGIVolume_Radius)
+		SHADER_PARAMETER(float, DDGIVolume_IrradianceScalar)
+		SHADER_PARAMETER(float, DDGIVolume_EmissiveMultiplier)
+		SHADER_PARAMETER(int, DDGIVolume_ProbeIndexStart)
+		SHADER_PARAMETER(int, DDGIVolume_ProbeIndexCount)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FDDGIVolumeDescGPU, DDGIVolume)
+		SHADER_PARAMETER(FVector3f, Sky_Color)
+		SHADER_PARAMETER_TEXTURE(TextureCube, Sky_Texture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, Sky_TextureSampler)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FRayTracingLightGrid, RayTracingLightGridUniformBuffer)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneUniformParameters, Scene)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FNaniteRayTracingUniformParameters, NaniteRayTracing)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -256,7 +282,7 @@ class FRayTracingRTXGIProbeViewRGS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FRayTracingRTXGIProbeViewRGS)
 	SHADER_USE_ROOT_PARAMETER_STRUCT(FRayTracingRTXGIProbeViewRGS, FGlobalShader)
 
-	class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY"); // If false, it will cull back face triangles. We want this on for probe relocation and to stop light leak.
+		class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY"); // If false, it will cull back face triangles. We want this on for probe relocation and to stop light leak.
 	class FEnableMaterialsDim : SHADER_PERMUTATION_BOOL("ENABLE_MATERIALS");                 // If false, forces the geo to opaque (no alpha test). We want this off for speed.
 	class FVolumeDebugView : SHADER_PERMUTATION_INT("VOLUME_DEBUG_VIEW", 3);
 
@@ -284,28 +310,35 @@ class FRayTracingRTXGIProbeViewRGS : public FGlobalShader
 	{
 		return ERayTracingPayloadType::RayTracingMaterial;
 	}
-	
+
+	static const FShaderBindingLayout* GetShaderBindingLayout(const FShaderPermutationParameters& Parameters)
+	{
+		return RayTracing::GetShaderBindingLayout(Parameters.Platform);
+	}
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-	SHADER_PARAMETER_RDG_BUFFER_SRV(RaytracingAccelerationStructure, TLAS)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(RaytracingAccelerationStructure, TLAS)
 
-	SHADER_PARAMETER(uint32, FrameRandomSeed)
+		SHADER_PARAMETER(uint32, FrameRandomSeed)
 
-	SHADER_PARAMETER(FVector3f, CameraPos)
-	SHADER_PARAMETER(FMatrix44f, CameraMatrix)
+		SHADER_PARAMETER(FVector3f, CameraPos)
+		SHADER_PARAMETER(FMatrix44f, CameraMatrix)
 
-	SHADER_PARAMETER(float, DDGIVolume_PreExposure)
-	SHADER_PARAMETER(int32, DDGIVolume_ShouldUsePreExposure)
-	SHADER_PARAMETER(float, DDGIVolume_IrradianceScalar)
+		SHADER_PARAMETER(float, DDGIVolume_PreExposure)
+		SHADER_PARAMETER(int32, DDGIVolume_ShouldUsePreExposure)
+		SHADER_PARAMETER(float, DDGIVolume_IrradianceScalar)
 
-	SHADER_PARAMETER(FVector3f, Sky_Color)
-	SHADER_PARAMETER_TEXTURE(TextureCube, Sky_Texture)
-	SHADER_PARAMETER_SAMPLER(SamplerState, Sky_TextureSampler)
+		SHADER_PARAMETER(FVector3f, Sky_Color)
+		SHADER_PARAMETER_TEXTURE(TextureCube, Sky_Texture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, Sky_TextureSampler)
 
-	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RadianceOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RadianceOutput)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneUniformParameters, Scene)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FNaniteRayTracingUniformParameters, NaniteRayTracing)
 
-	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
-	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FRayTracingLightGrid, RayTracingLightGridUniformBuffer) // ADD THIS LINE
-END_SHADER_PARAMETER_STRUCT()
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FRayTracingLightGrid, RayTracingLightGridUniformBuffer) // ADD THIS LINE
+	END_SHADER_PARAMETER_STRUCT()
 };
 
 IMPLEMENT_GLOBAL_SHADER(FRayTracingRTXGIProbeViewRGS, "/Plugin/RTXGI/Private/ProbeViewRGS.usf", "ProbeViewRGS", SF_RayGen);
@@ -317,14 +350,14 @@ class FDDGIIrradianceBlend : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FDDGIIrradianceBlend)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIIrradianceBlend, FGlobalShader)
 
-	class FRaysPerProbeEnum : SHADER_PERMUTATION_SPARSE_INT("RAYS_PER_PROBE",
-		int32(EDDGIRaysPerProbe::n144),
-		int32(EDDGIRaysPerProbe::n288),
-		int32(EDDGIRaysPerProbe::n432),
-		int32(EDDGIRaysPerProbe::n576),
-		int32(EDDGIRaysPerProbe::n720),
-		int32(EDDGIRaysPerProbe::n864),
-		int32(EDDGIRaysPerProbe::n1008));
+		class FRaysPerProbeEnum : SHADER_PERMUTATION_SPARSE_INT("RAYS_PER_PROBE",
+			int32(EDDGIRaysPerProbe::n144),
+			int32(EDDGIRaysPerProbe::n288),
+			int32(EDDGIRaysPerProbe::n432),
+			int32(EDDGIRaysPerProbe::n576),
+			int32(EDDGIRaysPerProbe::n720),
+			int32(EDDGIRaysPerProbe::n864),
+			int32(EDDGIRaysPerProbe::n1008));
 	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
 	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
 	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
@@ -377,14 +410,14 @@ class FDDGIDistanceBlend : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FDDGIDistanceBlend)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIDistanceBlend, FGlobalShader)
 
-	class FRaysPerProbeEnum : SHADER_PERMUTATION_SPARSE_INT("RAYS_PER_PROBE",
-		int32(EDDGIRaysPerProbe::n144),
-		int32(EDDGIRaysPerProbe::n288),
-		int32(EDDGIRaysPerProbe::n432),
-		int32(EDDGIRaysPerProbe::n576),
-		int32(EDDGIRaysPerProbe::n720),
-		int32(EDDGIRaysPerProbe::n864),
-		int32(EDDGIRaysPerProbe::n1008));
+		class FRaysPerProbeEnum : SHADER_PERMUTATION_SPARSE_INT("RAYS_PER_PROBE",
+			int32(EDDGIRaysPerProbe::n144),
+			int32(EDDGIRaysPerProbe::n288),
+			int32(EDDGIRaysPerProbe::n432),
+			int32(EDDGIRaysPerProbe::n576),
+			int32(EDDGIRaysPerProbe::n720),
+			int32(EDDGIRaysPerProbe::n864),
+			int32(EDDGIRaysPerProbe::n1008));
 	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
 	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
 	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
@@ -436,9 +469,9 @@ class FDDGIBorderRowUpdate : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FDDGIBorderRowUpdate)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIBorderRowUpdate, FGlobalShader)
 
-	class FProbeNumTexels : SHADER_PERMUTATION_SPARSE_INT("PROBE_NUM_TEXELS",
-		FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance,
-		FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
+		class FProbeNumTexels : SHADER_PERMUTATION_SPARSE_INT("PROBE_NUM_TEXELS",
+			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance,
+			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
 
 	using FPermutationDomain = TShaderPermutationDomain<FProbeNumTexels>;
 
@@ -467,9 +500,9 @@ class FDDGIBorderColumnUpdate : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FDDGIBorderColumnUpdate)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIBorderColumnUpdate, FGlobalShader)
 
-	class FProbeNumTexels : SHADER_PERMUTATION_SPARSE_INT("PROBE_NUM_TEXELS",
-		FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance,
-		FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
+		class FProbeNumTexels : SHADER_PERMUTATION_SPARSE_INT("PROBE_NUM_TEXELS",
+			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance,
+			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
 
 	using FPermutationDomain = TShaderPermutationDomain<FProbeNumTexels>;
 
@@ -500,7 +533,7 @@ class FDDGIProbesRelocate : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FDDGIProbesRelocate)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIProbesRelocate, FGlobalShader)
 
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
+		class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
 	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
 	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
 
@@ -540,7 +573,7 @@ class FDDGIProbesClassify : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FDDGIProbesClassify)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIProbesClassify, FGlobalShader)
 
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
+		class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
 	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
 	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
 	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
@@ -578,264 +611,265 @@ IMPLEMENT_GLOBAL_SHADER(FDDGIProbesClassify, "/Plugin/RTXGI/Private/SDK/ddgi/Pro
 
 namespace DDGIVolumeUpdate
 {
-// === DEBUG FUNCTIONS (GUARANTEED TO COMPILE) ===
+	// === DEBUG FUNCTIONS (GUARANTEED TO COMPILE) ===
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
-void DebugDDGIVolumeStatus(const FScene& Scene)
-{
-    UE_LOG(LogTemp, Warning, TEXT("=== DDGI Volume Status ==="));
-    
-    int32 ActiveVolumes = 0;
-    int32 EnabledVolumes = 0;
-    for (FDDGIVolumeSceneProxy* Proxy : FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread)
-    {
-        if (Proxy->OwningScene == &Scene)
-        {
-            ActiveVolumes++;
-            if (Proxy->ComponentData.EnableVolume)
-            {
-                EnabledVolumes++;
-                UE_LOG(LogTemp, Warning, TEXT("Volume: Enabled, Probes: %dx%dx%d, Location: %s"), 
-                    Proxy->ComponentData.ProbeCounts.X,
-                    Proxy->ComponentData.ProbeCounts.Y,
-                    Proxy->ComponentData.ProbeCounts.Z,
-                    *Proxy->ComponentData.Origin.ToString());
-            }
-        }
-    }
-    
-    UE_LOG(LogTemp, Warning, TEXT("Total volumes in scene: %d"), ActiveVolumes);
-    UE_LOG(LogTemp, Warning, TEXT("Enabled volumes: %d"), EnabledVolumes);
-}
+	void DebugDDGIVolumeStatus(const FScene& Scene)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("=== DDGI Volume Status ==="));
 
-void DebugRayTracingStatus(const FViewInfo& View)
-{
-    UE_LOG(LogTemp, Warning, TEXT("=== Ray Tracing Status ==="));
-    UE_LOG(LogTemp, Warning, TEXT("Ray Tracing Enabled: %s"), IsRayTracingEnabled() ? TEXT("Yes") : TEXT("No"));
-    UE_LOG(LogTemp, Warning, TEXT("Has Ray Tracing Scene: %s"), View.HasRayTracingScene() ? TEXT("Yes") : TEXT("No"));
-}
+		int32 ActiveVolumes = 0;
+		int32 EnabledVolumes = 0;
+		for (FDDGIVolumeSceneProxy* Proxy : FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread)
+		{
+			if (Proxy->OwningScene == &Scene)
+			{
+				ActiveVolumes++;
+				if (Proxy->ComponentData.EnableVolume)
+				{
+					EnabledVolumes++;
+					UE_LOG(LogTemp, Warning, TEXT("Volume: Enabled, Probes: %dx%dx%d, Location: %s"),
+						Proxy->ComponentData.ProbeCounts.X,
+						Proxy->ComponentData.ProbeCounts.Y,
+						Proxy->ComponentData.ProbeCounts.Z,
+						*Proxy->ComponentData.Origin.ToString());
+				}
+			}
+		}
 
-void DebugLightingSetup(const FScene& Scene)
-{
-    UE_LOG(LogTemp, Warning, TEXT("=== Lighting Setup Debug ==="));
-    
-    // Simple skylight check
-    if (Scene.SkyLight)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("SkyLight: Present"));
-        UE_LOG(LogTemp, Warning, TEXT("SkyLight Processed Texture: %s"), Scene.SkyLight->ProcessedTexture ? TEXT("Valid") : TEXT("Null"));
-    }
-    else
-    {
-        UE_LOG(LogTemp, Error, TEXT("No SkyLight in scene!"));
-    }
-    
-    // Simple light count
-    UE_LOG(LogTemp, Warning, TEXT("Total Lights in Scene: %d"), Scene.Lights.Num());
-    
-    // Count valid lights without accessing problematic members
-    int32 ValidLights = 0;
-    for (const FLightSceneInfoCompact& Light : Scene.Lights)
-    {
-        if (Light.LightSceneInfo && Light.LightSceneInfo->Proxy)
-        {
-            ValidLights++;
-        }
-    }
-    UE_LOG(LogTemp, Warning, TEXT("Valid Lights: %d"), ValidLights);
-}
+		UE_LOG(LogTemp, Warning, TEXT("Total volumes in scene: %d"), ActiveVolumes);
+		UE_LOG(LogTemp, Warning, TEXT("Enabled volumes: %d"), EnabledVolumes);
+	}
 
-void QuickDDGITest()
-{
-    UE_LOG(LogTemp, Warning, TEXT("=== QUICK DDGI TEST ==="));
-    
-    // Check if any volumes exist
-    int32 VolumeCount = FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Num();
-    UE_LOG(LogTemp, Warning, TEXT("DDGI Volumes found: %d"), VolumeCount);
-    
-    // Check ray tracing status
-    UE_LOG(LogTemp, Warning, TEXT("Ray Tracing Enabled: %s"), IsRayTracingEnabled() ? TEXT("Yes") : TEXT("No"));
-    
-    // Check DDGI CVars
-    static IConsoleVariable* CVarEnable = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RTXGI.DDGI.Enable"));
-    if (CVarEnable)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("DDGI Enabled: %d"), CVarEnable->GetInt());
-    }
-    
-    // Check if ray tracing is forced
-    static IConsoleVariable* CVarForceRT = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.ForceAllRayTracingEffects"));
-    if (CVarForceRT)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("Force All Ray Tracing: %d"), CVarForceRT->GetInt());
-    }
-}
+	void DebugRayTracingStatus(const FViewInfo& View)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("=== Ray Tracing Status ==="));
+		UE_LOG(LogTemp, Warning, TEXT("Ray Tracing Enabled: %s"), IsRayTracingEnabled() ? TEXT("Yes") : TEXT("No"));
+		//UE_LOG(LogTemp, Warning, TEXT("Has Ray Tracing Scene: %s"), View.HasRayTracingScene() ? TEXT("Yes") : TEXT("No"));
+		UE_LOG(LogTemp, Warning, TEXT("Has Ray Tracing Scene: %s"), (View.Family && View.Family->Scene && View.Family->Scene->GetRenderScene() && View.Family->Scene->GetRenderScene()->RayTracingScene.IsCreated()) ? TEXT("Yes") : TEXT("No"));
+	}
 
-void DebugRayTracingDetails()
-{
-    UE_LOG(LogTemp, Warning, TEXT("=== Ray Tracing Detailed Status ==="));
-    
-    // Check various ray tracing CVars
-    static IConsoleVariable* CVars[] = {
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing")),
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.Enable")),
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.ForceAllRayTracingEffects")),
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.RTXGI.DDGI.Enable")),
-    };
-    
-    const TCHAR* CVarNames[] = {
-        TEXT("r.RayTracing"),
-        TEXT("r.RayTracing.Enable"), 
-        TEXT("r.RayTracing.ForceAllRayTracingEffects"),
-        TEXT("r.RTXGI.DDGI.Enable"),
-    };
-    
-    for (int32 i = 0; i < 4; i++)
-    {
-        if (CVars[i])
-        {
-            UE_LOG(LogTemp, Warning, TEXT("%s: %d"), CVarNames[i], CVars[i]->GetInt());
-        }
-    }
-    
-    // Check RHI
-    FString RHIName = GDynamicRHI ? GDynamicRHI->GetName() : TEXT("No RHI");
-    UE_LOG(LogTemp, Warning, TEXT("Current RHI: %s"), *RHIName);
-    
-    // Check feature level
-    ERHIFeatureLevel::Type FeatureLevel = GMaxRHIFeatureLevel;
-    UE_LOG(LogTemp, Warning, TEXT("Max Feature Level: %d"), (int32)FeatureLevel);
-    
-    // Check if ray tracing is supported (use the correct function)
-    bool bSupported = IsRayTracingEnabled(); // This function checks if RT is supported AND enabled
-    UE_LOG(LogTemp, Warning, TEXT("IsRayTracingEnabled: %s"), bSupported ? TEXT("Yes") : TEXT("No"));
-    
-    // Check project settings
-    static IConsoleVariable* ProjectRT = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.Project"));
-    if (ProjectRT)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("Project Ray Tracing Setting: %d"), ProjectRT->GetInt());
-    }
-    
-    // Check additional important CVars
-    static IConsoleVariable* AdditionalCVars[] = {
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportRayTracing")),
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.ShaderBudget")),
-    };
-    
-    const TCHAR* AdditionalNames[] = {
-        TEXT("r.SupportRayTracing"),
-        TEXT("r.RayTracing.ShaderBudget"),
-    };
-    
-    for (int32 i = 0; i < 2; i++)
-    {
-        if (AdditionalCVars[i])
-        {
-            UE_LOG(LogTemp, Warning, TEXT("%s: %d"), AdditionalNames[i], AdditionalCVars[i]->GetInt());
-        }
-    }
-}
-void DebugShaderPlatformsDetailed()
-{
-    UE_LOG(LogTemp, Warning, TEXT("=== SHADER PLATFORMS DEBUG ==="));
-    
-    // Current system info
-    FString RHIName = GDynamicRHI ? GDynamicRHI->GetName() : TEXT("No RHI");
-    UE_LOG(LogTemp, Warning, TEXT("Current RHI: %s"), *RHIName);
-    UE_LOG(LogTemp, Warning, TEXT("Max Feature Level: %d"), (int32)GMaxRHIFeatureLevel);
-    
-    // Check feature level to platform mappings
-    UE_LOG(LogTemp, Warning, TEXT("--- Feature Level to Platform Mappings ---"));
-    for (int32 FeatureLevel = 0; FeatureLevel < ERHIFeatureLevel::Num; FeatureLevel++)
-    {
-        EShaderPlatform Platform = GShaderPlatformForFeatureLevel[FeatureLevel];
-        FString FeatureLevelName;
-        
-        switch (FeatureLevel)
-        {
-            case ERHIFeatureLevel::ES2_REMOVED: FeatureLevelName = TEXT("ES2"); break;
-            case ERHIFeatureLevel::ES3_1: FeatureLevelName = TEXT("ES3_1"); break;
-            case ERHIFeatureLevel::SM4_REMOVED: FeatureLevelName = TEXT("SM4"); break;
-            case ERHIFeatureLevel::SM5: FeatureLevelName = TEXT("SM5"); break;
-            case ERHIFeatureLevel::SM6: FeatureLevelName = TEXT("SM6"); break;
-            default: FeatureLevelName = TEXT("Unknown"); break;
-        }
-        
-        FString Status = TEXT("INVALID");
-        if (Platform != SP_NumPlatforms)
-        {
-            if (GGlobalShaderMap[Platform])
-            {
-                Status = TEXT("VALID + LOADED");
-            }
-            else
-            {
-                Status = TEXT("MAPPED BUT NOT LOADED");
-            }
-        }
-        
-        UE_LOG(LogTemp, Warning, TEXT("FeatureLevel %d (%s) -> Platform %d: %s"), 
-            FeatureLevel, *FeatureLevelName, (int32)Platform, *Status);
-    }
-    
-    // List ALL shader platforms and their status
-    UE_LOG(LogTemp, Warning, TEXT("--- All Shader Platforms Status ---"));
-    int32 ValidCount = 0;
-    for (int32 i = 0; i < SP_NumPlatforms; i++)
-    {
-        EShaderPlatform Platform = (EShaderPlatform)i;
-        if (GGlobalShaderMap[Platform])
-        {
-            ValidCount++;
-            
-            // Get platform name
-            FString PlatformName = LegacyShaderPlatformToShaderFormat(Platform).ToString();
-            
-            UE_LOG(LogTemp, Warning, TEXT("  Platform %d: %s - VALID"), i, *PlatformName);
-        }
-    }
-    UE_LOG(LogTemp, Warning, TEXT("Total valid platforms: %d / %d"), ValidCount, SP_NumPlatforms);
-    
-    // Check specific platforms we care about
-    UE_LOG(LogTemp, Warning, TEXT("--- Key Platforms for DDGI ---"));
-    EShaderPlatform ImportantPlatforms[] = {
-        SP_PCD3D_SM5,   // 0 - DirectX SM5
-        SP_PCD3D_SM6,   // 49 - DirectX SM6
-        SP_VULKAN_SM5,  // 5 - Vulkan SM5  
-        SP_VULKAN_SM6,  // 22 - Vulkan SM6
-    };
-    
-    const TCHAR* PlatformNames[] = {
-        TEXT("SP_PCD3D_SM5 (DX11 SM5)"),
-        TEXT("SP_PCD3D_SM6 (DX12 SM6)"),
-        TEXT("SP_VULKAN_SM5"),
-        TEXT("SP_VULKAN_SM6"),
-    };
-    
-    for (int32 i = 0; i < 4; i++)
-    {
-        FString Status = TEXT("NOT LOADED");
-        if (GGlobalShaderMap[ImportantPlatforms[i]])
-        {
-            Status = TEXT("LOADED");
-        }
-        UE_LOG(LogTemp, Warning, TEXT("  %s (Platform %d): %s"), 
-            PlatformNames[i], (int32)ImportantPlatforms[i], *Status);
-    }
-    
-    // Test the current mappings
-    UE_LOG(LogTemp, Warning, TEXT("--- Current Mappings Test ---"));
-    EShaderPlatform CurrentSM5 = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-    EShaderPlatform CurrentSM6 = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM6];
-    
-    UE_LOG(LogTemp, Warning, TEXT("SM5 Mapping: Platform %d (%s)"), 
-        (int32)CurrentSM5, 
-        GGlobalShaderMap[CurrentSM5] ? TEXT("VALID") : TEXT("INVALID"));
-        
-    UE_LOG(LogTemp, Warning, TEXT("SM6 Mapping: Platform %d (%s)"), 
-        (int32)CurrentSM6, 
-        GGlobalShaderMap[CurrentSM6] ? TEXT("VALID") : TEXT("INVALID"));
-}
+	void DebugLightingSetup(const FScene& Scene)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("=== Lighting Setup Debug ==="));
+
+		// Simple skylight check
+		if (Scene.SkyLight)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("SkyLight: Present"));
+			UE_LOG(LogTemp, Warning, TEXT("SkyLight Processed Texture: %s"), Scene.SkyLight->ProcessedTexture ? TEXT("Valid") : TEXT("Null"));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("No SkyLight in scene!"));
+		}
+
+		// Simple light count
+		UE_LOG(LogTemp, Warning, TEXT("Total Lights in Scene: %d"), Scene.Lights.Num());
+
+		// Count valid lights without accessing problematic members
+		int32 ValidLights = 0;
+		for (const FLightSceneInfoCompact& Light : Scene.Lights)
+		{
+			if (Light.LightSceneInfo && Light.LightSceneInfo->Proxy)
+			{
+				ValidLights++;
+			}
+		}
+		UE_LOG(LogTemp, Warning, TEXT("Valid Lights: %d"), ValidLights);
+	}
+
+	void QuickDDGITest()
+	{
+		UE_LOG(LogTemp, Warning, TEXT("=== QUICK DDGI TEST ==="));
+
+		// Check if any volumes exist
+		int32 VolumeCount = FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Num();
+		UE_LOG(LogTemp, Warning, TEXT("DDGI Volumes found: %d"), VolumeCount);
+
+		// Check ray tracing status
+		UE_LOG(LogTemp, Warning, TEXT("Ray Tracing Enabled: %s"), IsRayTracingEnabled() ? TEXT("Yes") : TEXT("No"));
+
+		// Check DDGI CVars
+		static IConsoleVariable* CVarEnable = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RTXGI.DDGI.Enable"));
+		if (CVarEnable)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("DDGI Enabled: %d"), CVarEnable->GetInt());
+		}
+
+		// Check if ray tracing is forced
+		static IConsoleVariable* CVarForceRT = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.ForceAllRayTracingEffects"));
+		if (CVarForceRT)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Force All Ray Tracing: %d"), CVarForceRT->GetInt());
+		}
+	}
+
+	void DebugRayTracingDetails()
+	{
+		UE_LOG(LogTemp, Warning, TEXT("=== Ray Tracing Detailed Status ==="));
+
+		// Check various ray tracing CVars
+		static IConsoleVariable* CVars[] = {
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing")),
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.Enable")),
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.ForceAllRayTracingEffects")),
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.RTXGI.DDGI.Enable")),
+		};
+
+		const TCHAR* CVarNames[] = {
+			TEXT("r.RayTracing"),
+			TEXT("r.RayTracing.Enable"),
+			TEXT("r.RayTracing.ForceAllRayTracingEffects"),
+			TEXT("r.RTXGI.DDGI.Enable"),
+		};
+
+		for (int32 i = 0; i < 4; i++)
+		{
+			if (CVars[i])
+			{
+				UE_LOG(LogTemp, Warning, TEXT("%s: %d"), CVarNames[i], CVars[i]->GetInt());
+			}
+		}
+
+		// Check RHI
+		FString RHIName = GDynamicRHI ? GDynamicRHI->GetName() : TEXT("No RHI");
+		UE_LOG(LogTemp, Warning, TEXT("Current RHI: %s"), *RHIName);
+
+		// Check feature level
+		ERHIFeatureLevel::Type FeatureLevel = GMaxRHIFeatureLevel;
+		UE_LOG(LogTemp, Warning, TEXT("Max Feature Level: %d"), (int32)FeatureLevel);
+
+		// Check if ray tracing is supported (use the correct function)
+		bool bSupported = IsRayTracingEnabled(); // This function checks if RT is supported AND enabled
+		UE_LOG(LogTemp, Warning, TEXT("IsRayTracingEnabled: %s"), bSupported ? TEXT("Yes") : TEXT("No"));
+
+		// Check project settings
+		static IConsoleVariable* ProjectRT = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.Project"));
+		if (ProjectRT)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Project Ray Tracing Setting: %d"), ProjectRT->GetInt());
+		}
+
+		// Check additional important CVars
+		static IConsoleVariable* AdditionalCVars[] = {
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportRayTracing")),
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing.ShaderBudget")),
+		};
+
+		const TCHAR* AdditionalNames[] = {
+			TEXT("r.SupportRayTracing"),
+			TEXT("r.RayTracing.ShaderBudget"),
+		};
+
+		for (int32 i = 0; i < 2; i++)
+		{
+			if (AdditionalCVars[i])
+			{
+				UE_LOG(LogTemp, Warning, TEXT("%s: %d"), AdditionalNames[i], AdditionalCVars[i]->GetInt());
+			}
+		}
+	}
+	void DebugShaderPlatformsDetailed()
+	{
+		UE_LOG(LogTemp, Warning, TEXT("=== SHADER PLATFORMS DEBUG ==="));
+
+		// Current system info
+		FString RHIName = GDynamicRHI ? GDynamicRHI->GetName() : TEXT("No RHI");
+		UE_LOG(LogTemp, Warning, TEXT("Current RHI: %s"), *RHIName);
+		UE_LOG(LogTemp, Warning, TEXT("Max Feature Level: %d"), (int32)GMaxRHIFeatureLevel);
+
+		// Check feature level to platform mappings
+		UE_LOG(LogTemp, Warning, TEXT("--- Feature Level to Platform Mappings ---"));
+		for (int32 FeatureLevel = 0; FeatureLevel < ERHIFeatureLevel::Num; FeatureLevel++)
+		{
+			EShaderPlatform Platform = GShaderPlatformForFeatureLevel[FeatureLevel];
+			FString FeatureLevelName;
+
+			switch (FeatureLevel)
+			{
+			case ERHIFeatureLevel::ES2_REMOVED: FeatureLevelName = TEXT("ES2"); break;
+			case ERHIFeatureLevel::ES3_1: FeatureLevelName = TEXT("ES3_1"); break;
+			case ERHIFeatureLevel::SM4_REMOVED: FeatureLevelName = TEXT("SM4"); break;
+			case ERHIFeatureLevel::SM5: FeatureLevelName = TEXT("SM5"); break;
+			case ERHIFeatureLevel::SM6: FeatureLevelName = TEXT("SM6"); break;
+			default: FeatureLevelName = TEXT("Unknown"); break;
+			}
+
+			FString Status = TEXT("INVALID");
+			if (Platform != SP_NumPlatforms)
+			{
+				if (GGlobalShaderMap[Platform])
+				{
+					Status = TEXT("VALID + LOADED");
+				}
+				else
+				{
+					Status = TEXT("MAPPED BUT NOT LOADED");
+				}
+			}
+
+			UE_LOG(LogTemp, Warning, TEXT("FeatureLevel %d (%s) -> Platform %d: %s"),
+				FeatureLevel, *FeatureLevelName, (int32)Platform, *Status);
+		}
+
+		// List ALL shader platforms and their status
+		UE_LOG(LogTemp, Warning, TEXT("--- All Shader Platforms Status ---"));
+		int32 ValidCount = 0;
+		for (int32 i = 0; i < SP_NumPlatforms; i++)
+		{
+			EShaderPlatform Platform = (EShaderPlatform)i;
+			if (GGlobalShaderMap[Platform])
+			{
+				ValidCount++;
+
+				// Get platform name
+				FString PlatformName = LegacyShaderPlatformToShaderFormat(Platform).ToString();
+
+				UE_LOG(LogTemp, Warning, TEXT("  Platform %d: %s - VALID"), i, *PlatformName);
+			}
+		}
+		UE_LOG(LogTemp, Warning, TEXT("Total valid platforms: %d / %d"), ValidCount, SP_NumPlatforms);
+
+		// Check specific platforms we care about
+		UE_LOG(LogTemp, Warning, TEXT("--- Key Platforms for DDGI ---"));
+		EShaderPlatform ImportantPlatforms[] = {
+			SP_PCD3D_SM5,   // 0 - DirectX SM5
+			SP_PCD3D_SM6,   // 49 - DirectX SM6
+			SP_VULKAN_SM5,  // 5 - Vulkan SM5  
+			SP_VULKAN_SM6,  // 22 - Vulkan SM6
+		};
+
+		const TCHAR* PlatformNames[] = {
+			TEXT("SP_PCD3D_SM5 (DX11 SM5)"),
+			TEXT("SP_PCD3D_SM6 (DX12 SM6)"),
+			TEXT("SP_VULKAN_SM5"),
+			TEXT("SP_VULKAN_SM6"),
+		};
+
+		for (int32 i = 0; i < 4; i++)
+		{
+			FString Status = TEXT("NOT LOADED");
+			if (GGlobalShaderMap[ImportantPlatforms[i]])
+			{
+				Status = TEXT("LOADED");
+			}
+			UE_LOG(LogTemp, Warning, TEXT("  %s (Platform %d): %s"),
+				PlatformNames[i], (int32)ImportantPlatforms[i], *Status);
+		}
+
+		// Test the current mappings
+		UE_LOG(LogTemp, Warning, TEXT("--- Current Mappings Test ---"));
+		EShaderPlatform CurrentSM5 = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
+		EShaderPlatform CurrentSM6 = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM6];
+
+		UE_LOG(LogTemp, Warning, TEXT("SM5 Mapping: Platform %d (%s)"),
+			(int32)CurrentSM5,
+			GGlobalShaderMap[CurrentSM5] ? TEXT("VALID") : TEXT("INVALID"));
+
+		UE_LOG(LogTemp, Warning, TEXT("SM6 Mapping: Platform %d (%s)"),
+			(int32)CurrentSM6,
+			GGlobalShaderMap[CurrentSM6] ? TEXT("VALID") : TEXT("INVALID"));
+	}
 #endif // !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 #if RHI_RAYTRACING
 	FDelegateHandle AnyRayTracingPassEnabledHandle;
@@ -869,14 +903,15 @@ void DebugShaderPlatformsDetailed()
 		FGlobalIlluminationPluginDelegates::FAnyRayTracingPassEnabled& ARTPEDelegate = FGlobalIlluminationPluginDelegates::AnyRayTracingPassEnabled();
 		AnyRayTracingPassEnabledHandle = ARTPEDelegate.AddStatic(
 			[](bool& anyEnabled)
-			{
-				const bool bCanEverRun = CVarDDGIForceRealtime.GetValueOnRenderThread()
-#if WITH_EDITOR
-				|| !CVarDDGIStaticInEditor.GetValueOnRenderThread()
-#endif
-				;
-				anyEnabled |= bCanEverRun;
-			}
+		{
+//			const bool bCanEverRun = CVarDDGIForceRealtime.GetValueOnRenderThread()
+//#if WITH_EDITOR
+//				|| !CVarDDGIStaticInEditor.GetValueOnRenderThread()
+//#endif
+//				;
+//			anyEnabled |= bCanEverRun;
+				anyEnabled |= true;
+		}
 		);
 #endif // RHI_RAYTRACING
 	}
@@ -920,16 +955,22 @@ void DebugShaderPlatformsDetailed()
 		float totalPriority = 0.0f;
 		for (FDDGIVolumeSceneProxy* proxy : FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread)
 		{
+
+			if (CVarDDGIStatic.GetValueOnRenderThread()) break;
+
 			// Don't update the volume if it isn't part of the current scene
 			if (proxy->OwningScene != &Scene) continue;
 
 			// Don't update static runtime volumes during gameplay
-			const bool bIsValidForStatic = (View.bIsGameView && !CVarDDGIForceRealtime.GetValueOnRenderThread())
+			/*const bool bIsValidForStatic = (View.bIsGameView && !CVarDDGIForceRealtime.GetValueOnRenderThread())
 #if WITH_EDITOR
 				|| CVarDDGIStaticInEditor.GetValueOnRenderThread()
 #endif
-				;
-			if (bIsValidForStatic && proxy->ComponentData.RuntimeStatic) continue;
+				;*/
+			//if (bIsValidForStatic && proxy->ComponentData.RuntimeStatic) continue;
+
+
+			if (View.bIsGameView && proxy->ComponentData.RuntimeStatic) continue;
 
 			// Don't update the volume if it is disabled
 			if (!proxy->ComponentData.EnableVolume) continue;
@@ -950,7 +991,7 @@ void DebugShaderPlatformsDetailed()
 			{
 				DDGIUpdateVolume_RenderThread(Scene, View, GraphBuilder, sceneVolumes[index], true);
 				// UpdateRenderThreadData isn't called every frame, so we need to reset it here.
-				sceneVolumes[index]->ComponentData.bForceUpdate = false; 
+				sceneVolumes[index]->ComponentData.bForceUpdate = false;
 			}
 		}
 
@@ -1045,7 +1086,8 @@ void DebugShaderPlatformsDetailed()
 #else
 	bool ShouldDynamicUpdate(const FScene& Scene, const FViewInfo& View)
 	{
-		return ShouldRenderRayTracingEffect(true) && View.HasRayTracingScene();
+		//return ShouldRenderRayTracingEffect(true) && View.HasRayTracingScene();
+		return ShouldRenderRayTracingEffect(true) && (View.Family && View.Family->Scene && View.Family->Scene->GetRenderScene() && View.Family->Scene->GetRenderScene()->RayTracingScene.IsCreated());
 	}
 #endif
 
@@ -1057,7 +1099,7 @@ void DebugShaderPlatformsDetailed()
 /*#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 		static int32 DebugFrameCount = 0;
 		DebugFrameCount++;
-    
+
 		if (DebugFrameCount % 180 == 0) // Every 3 seconds at 60fps
 		{
 			QuickDDGITest();
@@ -1068,7 +1110,7 @@ void DebugShaderPlatformsDetailed()
 			DebugShaderPlatformsDetailed();
 		}
 #endif*/
-		// Early out if ray tracing is not enabled
+// Early out if ray tracing is not enabled
 #if ENGINE_MAJOR_VERSION < 5
 		if (!ShouldDynamicUpdate(View)) return;
 #else
@@ -1119,142 +1161,109 @@ void DebugShaderPlatformsDetailed()
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 	void DDGIUpdateVolume_RenderThread_DDGIProbesTextureVis(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder)
-{
-    // Early out if not visualizing probes
-    int DDGIProbesTextureVis = FMath::Clamp(CVarDDGIProbesTextureVis.GetValueOnRenderThread(), 0, 3);
+	{
+		// Early out if not visualizing probes
+		int DDGIProbesTextureVis = FMath::Clamp(CVarDDGIProbesTextureVis.GetValueOnRenderThread(), 0, 3);
 #if ENGINE_MAJOR_VERSION < 5
-    if (DDGIProbesTextureVis == 0 || View.RayTracingScene.RayTracingSceneRHI == nullptr) return;
+		if (DDGIProbesTextureVis == 0 || View.RayTracingScene.RayTracingSceneRHI == nullptr) return;
 #else
-    if (DDGIProbesTextureVis == 0 || !View.HasRayTracingScene()) return;
+		//if (DDGIProbesTextureVis == 0 || !View.HasRayTracingScene()) return;
+		if (DDGIProbesTextureVis == 0 || !(View.Family && View.Family->Scene && View.Family->Scene->GetRenderScene() && View.Family->Scene->GetRenderScene()->RayTracingScene.IsCreated())) return;
 #endif
 
-    static const int c_probeVisWidth = 800;
-    static const int c_probeVisHeight = 600;
+		static const int c_probeVisWidth = 800;
+		static const int c_probeVisHeight = 600;
 
-    // create the texture and uav being rendered to
-    FRDGTextureDesc ProbeVisTex = FRDGTextureDesc::Create2D(
-        FIntPoint(c_probeVisWidth, c_probeVisHeight),
-        EPixelFormat::PF_A32B32G32R32F,
-        FClearValueBinding::None,
-        TexCreate_ShaderResource | TexCreate_UAV
-    );
-    FRDGTextureUAVRef ProbeVisUAV = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(ProbeVisTex, TEXT("DDGIProbesTexture")));
+		// create the texture and uav being rendered to
+		FRDGTextureDesc ProbeVisTex = FRDGTextureDesc::Create2D(
+			FIntPoint(c_probeVisWidth, c_probeVisHeight),
+			EPixelFormat::PF_A32B32G32R32F,
+			FClearValueBinding::None,
+			TexCreate_ShaderResource | TexCreate_UAV
+		);
+		FRDGTextureUAVRef ProbeVisUAV = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(ProbeVisTex, TEXT("DDGIProbesTexture")));
 
-    // get the shader
-    auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-    FRayTracingRTXGIProbeViewRGS::FPermutationDomain PermutationVector;
-    PermutationVector.Set<FRayTracingRTXGIProbeViewRGS::FEnableTwoSidedGeometryDim>(true);
-    PermutationVector.Set<FRayTracingRTXGIProbeViewRGS::FEnableMaterialsDim>(false);
-    PermutationVector.Set<FRayTracingRTXGIProbeViewRGS::FVolumeDebugView>(DDGIProbesTextureVis - 1);
-    TShaderMapRef<FRayTracingRTXGIProbeViewRGS> RayGenerationShader(ShaderMap, PermutationVector);
+		// get the shader
+		auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+		FRayTracingRTXGIProbeViewRGS::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FRayTracingRTXGIProbeViewRGS::FEnableTwoSidedGeometryDim>(true);
+		PermutationVector.Set<FRayTracingRTXGIProbeViewRGS::FEnableMaterialsDim>(false);
+		PermutationVector.Set<FRayTracingRTXGIProbeViewRGS::FVolumeDebugView>(DDGIProbesTextureVis - 1);
+		TShaderMapRef<FRayTracingRTXGIProbeViewRGS> RayGenerationShader(ShaderMap, PermutationVector);
 
-    // fill out shader parameters
-    FRayTracingRTXGIProbeViewRGS::FParameters DefaultPassParameters;
-    FRayTracingRTXGIProbeViewRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRayTracingRTXGIProbeViewRGS::FParameters>();
-    *PassParameters = DefaultPassParameters;
-    PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
-    PassParameters->DDGIVolume_PreExposure = View.PreExposure;
-    PassParameters->DDGIVolume_ShouldUsePreExposure = View.Family->EngineShowFlags.Tonemapper;
-    PassParameters->DDGIVolume_IrradianceScalar = FMath::Clamp(CVarDDGIIrradianceScalar.GetValueOnRenderThread(), 0.001f, 1.0f);
+		// fill out shader parameters
+		FRayTracingRTXGIProbeViewRGS::FParameters DefaultPassParameters;
+		FRayTracingRTXGIProbeViewRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRayTracingRTXGIProbeViewRGS::FParameters>();
+		*PassParameters = DefaultPassParameters;
+		PassParameters->Scene = GetSceneUniformBufferRef(GraphBuilder, View);
+		PassParameters->NaniteRayTracing = Nanite::GetPublicGlobalRayTracingUniformBuffer();
+		PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
+		PassParameters->DDGIVolume_PreExposure = View.PreExposure;
+		PassParameters->DDGIVolume_ShouldUsePreExposure = View.Family->EngineShowFlags.Tonemapper;
+		PassParameters->DDGIVolume_IrradianceScalar = FMath::Clamp(CVarDDGIIrradianceScalar.GetValueOnRenderThread(), 0.001f, 1.0f);
 
-    PassParameters->CameraPos = static_cast<FVector3f>(View.ViewMatrices.GetViewOrigin());
-    PassParameters->CameraMatrix = static_cast<FMatrix44f>(View.ViewMatrices.GetViewMatrix().Inverse());
+		PassParameters->CameraPos = static_cast<FVector3f>(View.ViewMatrices.GetViewOrigin());
+		PassParameters->CameraMatrix = static_cast<FMatrix44f>(View.ViewMatrices.GetViewMatrix().Inverse());
 
 #if ENGINE_MAJOR_VERSION < 5
-    PassParameters->TLAS = View.RayTracingScene.RayTracingSceneSRV;
+		PassParameters->TLAS = View.RayTracingScene.RayTracingSceneSRV;
 #else
-    PassParameters->TLAS = View.GetRayTracingSceneLayerViewChecked(ERayTracingSceneLayer::Base);
+		//PassParameters->TLAS = View.GetRayTracingSceneLayerViewChecked(ERayTracingSceneLayer::Base);
+		PassParameters->TLAS = View.Family->Scene->GetRenderScene()->RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base);
 #endif
-    PassParameters->RadianceOutput = ProbeVisUAV;
-    PassParameters->FrameRandomSeed = GFrameNumber;
+		PassParameters->RadianceOutput = ProbeVisUAV;
+		PassParameters->FrameRandomSeed = GFrameNumber;
 
-    // skylight parameters
-    if (Scene.SkyLight && Scene.SkyLight->ProcessedTexture)
-    {
-        PassParameters->Sky_Color = static_cast<FVector3f>(Scene.SkyLight->GetEffectiveLightColor());
-        PassParameters->Sky_Texture = Scene.SkyLight->ProcessedTexture->TextureRHI;
-        PassParameters->Sky_TextureSampler = Scene.SkyLight->ProcessedTexture->SamplerStateRHI;
-    }
-    else
-    {
-        PassParameters->Sky_Color = FVector3f(0.0);
-        PassParameters->Sky_Texture = GBlackTextureCube->TextureRHI;
-        PassParameters->Sky_TextureSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-    }
+		// skylight parameters
+		if (Scene.SkyLight && Scene.SkyLight->ProcessedTexture)
+		{
+			PassParameters->Sky_Color = static_cast<FVector3f>(Scene.SkyLight->GetEffectiveLightColor());
+			PassParameters->Sky_Texture = Scene.SkyLight->ProcessedTexture->TextureRHI;
+			PassParameters->Sky_TextureSampler = Scene.SkyLight->ProcessedTexture->SamplerStateRHI;
+		}
+		else
+		{
+			PassParameters->Sky_Color = FVector3f(0.0);
+			PassParameters->Sky_Texture = GBlackTextureCube->TextureRHI;
+			PassParameters->Sky_TextureSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		}
 
-    PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-    PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
-    FIntPoint DispatchSize(c_probeVisWidth, c_probeVisHeight);
+		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+		PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
+		FIntPoint DispatchSize(c_probeVisWidth, c_probeVisHeight);
 
-    // Get reference to the SBT - don't create a local copy
-    const FRayTracingShaderBindingTable& RayTracingSBT = Scene.RayTracingSBT;
+		GraphBuilder.AddPass(
+			RDG_EVENT_NAME("DDGI RTRadiance %dx%d", DispatchSize.X, DispatchSize.Y),
+			PassParameters,
+			ERDGPassFlags::Compute,
+			[PassParameters, &View, RayGenerationShader,
+			DispatchSize]
+			(FRHICommandListImmediate& RHICmdList)
+		{
+			if (View.MaterialRayTracingData.PipelineState)
+			{
+				// Set ray gen shader
+				FRHIRayTracingShader* RayGenShaderRHI = RayGenerationShader.GetRayTracingShader();
+				FRHIBatchedShaderParameters& GlobalResources = RHICmdList.GetScratchShaderParameters();
+				SetShaderParameters(GlobalResources, RayGenerationShader, *PassParameters);
 
-    GraphBuilder.AddPass(
-        RDG_EVENT_NAME("DDGI RTRadiance %dx%d", DispatchSize.X, DispatchSize.Y),
-        PassParameters,
-        ERDGPassFlags::Compute,
-        [PassParameters, RayTracingSceneRHI = View.GetRayTracingSceneChecked(ERayTracingSceneLayer::Base), &View, RayGenerationShader,
-            DispatchSize, &RayTracingSBT] // Capture by reference
-        (FRHICommandListImmediate& RHICmdList)
-        {
-            // Check if we have a valid material pipeline
-            if (View.MaterialRayTracingData.PipelineState)
-            {
-                FRayTracingPipelineStateInitializer Initializer;
 
-				// Get the binding layout from the compiled shader instance
-     //        	const FShaderBindingLayout* ShaderBindingLayout = RayTracing::GetShaderBindingLayout(GMaxRHIShaderPlatform);
-					// if (ShaderBindingLayout)
-					// {
-					// 	Initializer.ShaderBindingLayout = &ShaderBindingLayout->RHILayout;
-					// }
+				FRHIUniformBuffer* SceneUniformBuffer = PassParameters->Scene->GetRHI();
+				FRHIUniformBuffer* NaniteRayTracingUniformBuffer = PassParameters->NaniteRayTracing->GetRHI();
+				TOptional<FScopedUniformBufferStaticBindings> StaticUniformBufferScope = RayTracing::BindStaticUniformBufferBindings(View, SceneUniformBuffer, NaniteRayTracingUniformBuffer, RHICmdList);
 
-                Initializer.MaxPayloadSizeInBytes = GetRayTracingPayloadTypeMaxSize(ERayTracingPayloadType::RayTracingMaterial);
-
-                // Set ray gen shader
-                FRHIRayTracingShader* RayGenShaderRHI = RayGenerationShader.GetRayTracingShader();
-            	if (!RayGenShaderRHI)
-            	{
-					UE_LOG(LogTemp, Error, TEXT("Ray gen shader RHI is null!"));
-					return;
-				}
-                FRHIRayTracingShader* RayGenShaderTable[] = {RayGenShaderRHI};
-                Initializer.SetRayGenShaderTable(RayGenShaderTable);
-
-                FRHIRayTracingShader* HitGroupTable[] = {GetRayTracingDefaultOpaqueShader(View.ShaderMap)};
-                Initializer.SetHitGroupTable(HitGroupTable);
-
-                FRHIRayTracingShader* MissGroupTable[] = {GetRayTracingDefaultMissShader(View.ShaderMap)};
-                Initializer.SetMissShaderTable(MissGroupTable);
-
-                FRayTracingPipelineState* Pipeline = PipelineStateCache::GetAndOrCreateRayTracingPipelineState(RHICmdList, Initializer);
-
-                if (Pipeline)
-                {
-                    FRHIBatchedShaderParameters& GlobalResources = RHICmdList.GetScratchShaderParameters();
-                    SetShaderParameters(GlobalResources, RayGenerationShader, *PassParameters);
-
-                    // Create SBT like Lumen does - use FShaderBindingTableRHIRef directly
-                    FShaderBindingTableRHIRef SBT = RayTracingSBT.AllocateTransientRHI(RHICmdList, ERayTracingShaderBindingMode::RTPSO,
-                        ERayTracingHitGroupIndexingMode::Disallow, Initializer.GetMaxLocalBindingDataSize());
-
-                    RHICmdList.SetDefaultRayTracingHitGroup(SBT, Pipeline, 0);
-                    RHICmdList.SetRayTracingMissShader(SBT, 0, Pipeline, 0 /* ShaderIndexInPipeline */, 0, nullptr, 0);
-                    RHICmdList.CommitShaderBindingTable(SBT);
-
-                    RHICmdList.RayTraceDispatch(
-                        Pipeline,
-                        RayGenShaderRHI,
-                        SBT,
-                        GlobalResources,
-                        DispatchSize.X,
-                        DispatchSize.Y
-                    );
-                }
-            }
-        }
-    );
-}
+				RHICmdList.RayTraceDispatch(
+					View.MaterialRayTracingData.PipelineState,
+					RayGenShaderRHI,
+					View.MaterialRayTracingData.ShaderBindingTable,
+					GlobalResources,
+					DispatchSize.X,
+					DispatchSize.Y
+				);
+			}
+		}
+		);
+	}
 #endif //!(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 
 	void DDGIUpdateVolume_RenderThread_RTRadiance(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureRef ProbesRadianceTex, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate = false)
@@ -1298,7 +1307,11 @@ void DebugShaderPlatformsDetailed()
 		FRayTracingRTXGIProbeUpdateRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRayTracingRTXGIProbeUpdateRGS::FParameters>();
 		*PassParameters = DefaultPassParameters;
 
-		PassParameters->TLAS = Scene.RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base, View.GetRayTracingSceneViewHandle());
+		PassParameters->Scene = GetSceneUniformBufferRef(GraphBuilder, View);
+		PassParameters->NaniteRayTracing = Nanite::GetPublicGlobalRayTracingUniformBuffer();
+
+		//PassParameters->TLAS = Scene.RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base, View.GetRayTracingSceneViewHandle());
+		PassParameters->TLAS = Scene.RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base);
 		PassParameters->RadianceOutput = ProbesRadianceUAV;
 		PassParameters->FrameRandomSeed = GFrameNumber;
 		PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
@@ -1373,7 +1386,6 @@ void DebugShaderPlatformsDetailed()
 
 		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 		PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
-		const FRayTracingShaderBindingTable& RayTracingSBT = Scene.RayTracingSBT;
 		FIntPoint DispatchSize = ProbesRadianceTex->Desc.Extent;
 
 		GraphBuilder.AddPass(
@@ -1381,69 +1393,40 @@ void DebugShaderPlatformsDetailed()
 			PassParameters,
 			ERDGPassFlags::Compute,
 #if ENGINE_MAJOR_VERSION < 5
-[PassParameters, RayTracingSceneRHI = View.RayTracingScene.RayTracingSceneRHI, &View, RayGenerationShader, DispatchSize, ProbesRadianceTex]
-(FRHICommandList& RHICmdList)
+			[PassParameters, RayTracingSceneRHI = View.RayTracingScene.RayTracingSceneRHI, &View, RayGenerationShader, DispatchSize, ProbesRadianceTex]
+			(FRHICommandList& RHICmdList)
 #else
-[PassParameters, RayTracingSceneRHI = View.GetRayTracingSceneChecked(ERayTracingSceneLayer::Base), &View, RayGenerationShader, DispatchSize, &RayTracingSBT]
-(FRHICommandListImmediate& RHICmdList)
+			[PassParameters, &View, RayGenerationShader, DispatchSize]
+			(FRHICommandListImmediate& RHICmdList)
 #endif
-{
-
-		if (View.MaterialRayTracingData.PipelineState)
-            {
-                FRayTracingPipelineStateInitializer Initializer;
-
-                // Try to get from the View's material data instead
-				// const FShaderBindingLayout* ShaderBindingLayout = RayTracing::GetShaderBindingLayout(GMaxRHIShaderPlatform);
-				// if (ShaderBindingLayout)
-				// {
-				// 	Initializer.ShaderBindingLayout = &ShaderBindingLayout->RHILayout;
-				// }
-
-                Initializer.MaxPayloadSizeInBytes = GetRayTracingPayloadTypeMaxSize(ERayTracingPayloadType::RayTracingMaterial);
-
-                // Set ray gen shader
-                FRHIRayTracingShader* RayGenShaderRHI = RayGenerationShader.GetRayTracingShader();
+		{
+			if (View.MaterialRayTracingData.PipelineState)
+			{
+				// Set ray gen shader
+				FRHIRayTracingShader* RayGenShaderRHI = RayGenerationShader.GetRayTracingShader();
 				if (!RayGenShaderRHI)
 				{
 					UE_LOG(LogTemp, Error, TEXT("Ray gen shader RHI is null!"));
 					return;
 				}
-                FRHIRayTracingShader* RayGenShaderTable[] = {RayGenShaderRHI};
-                Initializer.SetRayGenShaderTable(RayGenShaderTable);
 
-                FRHIRayTracingShader* HitGroupTable[] = {GetRayTracingDefaultOpaqueShader(View.ShaderMap)};
-                Initializer.SetHitGroupTable(HitGroupTable);
+				FRHIBatchedShaderParameters& GlobalResources = RHICmdList.GetScratchShaderParameters();
+				SetShaderParameters(GlobalResources, RayGenerationShader, *PassParameters);
 
-                FRHIRayTracingShader* MissGroupTable[] = {GetRayTracingDefaultMissShader(View.ShaderMap)};
-                Initializer.SetMissShaderTable(MissGroupTable);
+				FRHIUniformBuffer* SceneUniformBuffer = PassParameters->Scene->GetRHI();
+				FRHIUniformBuffer* NaniteRayTracingUniformBuffer = PassParameters->NaniteRayTracing->GetRHI();
+				TOptional<FScopedUniformBufferStaticBindings> StaticUniformBufferScope = RayTracing::BindStaticUniformBufferBindings(View, SceneUniformBuffer, NaniteRayTracingUniformBuffer, RHICmdList);
 
-                FRayTracingPipelineState* Pipeline = PipelineStateCache::GetAndOrCreateRayTracingPipelineState(RHICmdList, Initializer);
-
-                if (Pipeline)
-                {
-                    FRHIBatchedShaderParameters& GlobalResources = RHICmdList.GetScratchShaderParameters();
-                    SetShaderParameters(GlobalResources, RayGenerationShader, *PassParameters);
-
-                    // Create SBT like Lumen does - use FShaderBindingTableRHIRef directly
-                    FShaderBindingTableRHIRef SBT = RayTracingSBT.AllocateTransientRHI(RHICmdList, ERayTracingShaderBindingMode::RTPSO,
-                        ERayTracingHitGroupIndexingMode::Disallow, Initializer.GetMaxLocalBindingDataSize());
-
-                    RHICmdList.SetDefaultRayTracingHitGroup(SBT, Pipeline, 0);
-                    RHICmdList.SetRayTracingMissShader(SBT, 0, Pipeline, 0 /* ShaderIndexInPipeline */, 0, nullptr, 0);
-                    RHICmdList.CommitShaderBindingTable(SBT);
-
-                    RHICmdList.RayTraceDispatch(
-                        Pipeline,
-                        RayGenShaderRHI,
-                        SBT,
-                        GlobalResources,
-                        DispatchSize.X,
-                        DispatchSize.Y
-                    );
-                }
-            }
-}
+				RHICmdList.RayTraceDispatch(
+					View.MaterialRayTracingData.PipelineState,
+					RayGenShaderRHI,
+					View.MaterialRayTracingData.ShaderBindingTable,
+					GlobalResources,
+					DispatchSize.X,
+					DispatchSize.Y
+				);
+			}
+		}
 		);
 	}
 
@@ -1862,6 +1845,9 @@ void DebugShaderPlatformsDetailed()
 } // namespace DDGIVolumeUpdate
 
 #undef LOCTEXT_NAMESPACE
+
+#if !IS_MONOLITHIC
+
 bool FViewInfo::HasRayTracingScene() const
 {
 	check(Family);
@@ -1880,7 +1866,7 @@ FRHIRayTracingScene* FViewInfo::GetRayTracingSceneChecked(ERayTracingSceneLayer 
 	{
 		if (FScene* Scene = Family->Scene->GetRenderScene())
 		{
-			FRHIRayTracingScene* Result = Scene->RayTracingScene.GetRHIRayTracingScene(Layer, GetRayTracingSceneViewHandle());
+			FRHIRayTracingScene* Result = Scene->RayTracingScene.GetRHIRayTracingScene(Layer);
 			checkf(Result, TEXT("Ray tracing scene is expected to be created at this point."));
 			return Result;
 		}
@@ -1896,7 +1882,7 @@ FRDGBufferSRVRef FViewInfo::GetRayTracingSceneLayerViewChecked(ERayTracingSceneL
 	{
 		if (FScene* Scene = Family->Scene->GetRenderScene())
 		{
-			Result = Scene->RayTracingScene.GetLayerView(Layer, GetRayTracingSceneViewHandle());
+			Result = Scene->RayTracingScene.GetLayerView(Layer);
 		}
 	}
 	checkf(Result, TEXT("Ray tracing scene SRV is expected to be created at this point."));
@@ -1910,22 +1896,11 @@ FRDGBufferUAVRef FViewInfo::GetRayTracingInstanceHitCountUAV(FRDGBuilder& GraphB
 	{
 		if (FScene* Scene = Family->Scene->GetRenderScene())
 		{
-			return Scene->RayTracingScene.GetInstanceHitCountBufferUAV(ERayTracingSceneLayer::Base, GetRayTracingSceneViewHandle());
+			//return Scene->RayTracingScene.GetInstanceHitCountBufferUAV(ERayTracingSceneLayer::Base, GetRayTracingSceneViewHandle());
+			return Scene->RayTracingScene.GetInstanceHitCountBufferUAV(ERayTracingSceneLayer::Base);
 		}
-	}    
-	return nullptr;
-}
-
-const FViewInfo* FViewInfo::GetPrimaryView() const
-{
-	// It is valid for this function to return itself if it's already the primary view.
-	if (Family && Family->Views.IsValidIndex(PrimaryViewIndex))
-	{
-		const FSceneView* PrimaryView = Family->Views[PrimaryViewIndex];
-		check(PrimaryView->bIsViewInfo);
-		return static_cast<const FViewInfo*>(PrimaryView);
 	}
-	return this;
+	return nullptr;
 }
 
 FRHIRayTracingShader* GetRayTracingDefaultMissShader(const FGlobalShaderMap* ShaderMap)
@@ -1937,4 +1912,4 @@ FRHIRayTracingShader* GetRayTracingDefaultOpaqueShader(const FGlobalShaderMap* S
 {
 	return ShaderMap->GetShader<FOpaqueShadowHitGroup>().GetRayTracingShader();
 }
-
+#endif

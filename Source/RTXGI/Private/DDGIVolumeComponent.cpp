@@ -975,63 +975,29 @@ static FDDGITexturePixels GetTexturePixelsStep1_RenderThread(FRHICommandListImme
 	// Early out if a GPU texture is not provided
 	if (!textureGPU) return ret;
 
-	const FIntVector textureSize = textureGPU->GetSizeXYZ();
-	if (textureSize.X <= 0 || textureSize.Y <= 0) return ret;
-
 	//ret.Desc.Width = textureGPU->GetTexture2D()->GetSizeX();
 	//ret.Desc.Height = textureGPU->GetTexture2D()->GetSizeY();
-	ret.Desc.Width = textureSize.X;
-	ret.Desc.Height = textureSize.Y;
+	ret.Desc.Width = textureGPU->GetSizeX();
+	ret.Desc.Height = textureGPU->GetSizeY();
+	
 	ret.Desc.PixelFormat = (int32)textureGPU->GetFormat();
 
 	// Create the texture
+	//FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, textureGPU->GetFormat());
 	FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, textureGPU->GetFormat());
-
-//#if PLATFORM_PS5
-//	EPixelFormat SourceFormat = textureGPU->GetFormat();
-//	// PS5 might need format conversion
-//	if (SourceFormat == PF_A2B10G10R10)
-//	{
-//		// Convert to a format PS5 definitely supports
-//		SourceFormat = PF_FloatRGBA;
-//	}
-//
-//	FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(
-//		TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, SourceFormat);
-//#else
-	//FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(
-		//TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, textureGPU->GetFormat());
-//#endif
-
-	CreateInfo.AddFlags(TexCreate_ShaderResource
-
-#if PLATFORM_PS5
-		| TexCreate_CPUReadback
-#endif
-	);
+	CreateInfo.AddFlags(TexCreate_ShaderResource);
 
 	CreateInfo.InitialState = ERHIAccess::CopyDest;
 	ret.Texture = RHICreateTexture(CreateInfo);
-
-	// Use the actual allocated dest size (may differ from requested due to platform alignment)
-	const FIntVector destSize = ret.Texture->GetSizeXYZ();
-	// Clamp copy region to the minimum of source and dest to avoid out-of-bounds copies
-	const int32 copyWidth = FMath::Min(textureSize.X, destSize.X);
-	const int32 copyHeight = FMath::Min(textureSize.Y, destSize.Y);
-
-	// Update the descriptor to reflect what we can actually read back
-	ret.Desc.Width = copyWidth;
-	ret.Desc.Height = copyHeight;
 
 	// Transition the GPU texture to a copy source
 	RHICmdList.Transition(FRHITransitionInfo(textureGPU, ERHIAccess::SRVMask, ERHIAccess::CopySrc));
 
 	// Schedule a copy of the GPU texture to the CPU accessible GPU texture
 	//RHICmdList.CopyTexture(textureGPU, ret.Texture, FRHICopyTextureInfo{});
-
-	// Schedule a bounded copy of the GPU texture to the CPU accessible GPU texture
-	FRHICopyTextureInfo CopyInfo{};
-	CopyInfo.Size = FIntVector(copyWidth, copyHeight, 1);
+	// Use explicit copy size to prevent mismatch between queried size and D3D12 resource dimensions
+	FRHICopyTextureInfo CopyInfo;
+	CopyInfo.Size = FIntVector(ret.Desc.Width, ret.Desc.Height, 1);
 	RHICmdList.CopyTexture(textureGPU, ret.Texture, CopyInfo);
 
 	// Transition the GPU texture back to general
@@ -1043,46 +1009,16 @@ static FDDGITexturePixels GetTexturePixelsStep1_RenderThread(FRHICommandListImme
 // Read the CPU accessible GPU texture data into CPU memory
 static void GetTexturePixelsStep2_RenderThread(FRHICommandListImmediate& RHICmdList, FDDGITexturePixels& texturePixels)
 {
-	if (!texturePixels.Texture)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DDGI GetTexturePixelsStep2 - NULL TEXTURE!"));
-		return;
-	}
-
-	UE_LOG(LogTemp, Warning, TEXT("DDGI GetTexturePixelsStep2 - Locking %dx%d texture"),
-		texturePixels.Desc.Width, texturePixels.Desc.Height);
+	if (!texturePixels.Texture) return;
 
 	// Get a pointer to the CPU memory
-	//uint8* mappedTextureMemory = (uint8*)RHICmdList.LockTexture2D(texturePixels.Texture, 0, RLM_ReadOnly, texturePixels.Desc.Stride, false);
-
-	//// Copy the texture data to CPU memory
-	//texturePixels.Pixels.AddZeroed(texturePixels.Desc.Height * texturePixels.Desc.Stride);
-	//FMemory::Memcpy(&texturePixels.Pixels[0], mappedTextureMemory, texturePixels.Desc.Height * texturePixels.Desc.Stride);
-
-	//RHICmdList.UnlockTexture2D(texturePixels.Texture, 0, false);
-
-	// Get a pointer to the CPU memory
-	uint32 Stride = 0;
-	uint8* mappedTextureMemory = (uint8*)RHICmdList.LockTexture2D(texturePixels.Texture, 0, RLM_ReadOnly, Stride, false);
-
-	if (!mappedTextureMemory)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DDGI GetTexturePixelsStep2 - FAILED TO LOCK TEXTURE!"));
-		return;
-	}
-
-	texturePixels.Desc.Stride = Stride;
-
-	UE_LOG(LogTemp, Warning, TEXT("DDGI GetTexturePixelsStep2 - Stride:%d, Copying %d bytes"),
-		Stride, texturePixels.Desc.Height * Stride);
+	uint8* mappedTextureMemory = (uint8*)RHICmdList.LockTexture2D(texturePixels.Texture, 0, RLM_ReadOnly, texturePixels.Desc.Stride, false);
 
 	// Copy the texture data to CPU memory
 	texturePixels.Pixels.AddZeroed(texturePixels.Desc.Height * texturePixels.Desc.Stride);
 	FMemory::Memcpy(&texturePixels.Pixels[0], mappedTextureMemory, texturePixels.Desc.Height * texturePixels.Desc.Stride);
 
 	RHICmdList.UnlockTexture2D(texturePixels.Texture, 0, false);
-
-	UE_LOG(LogTemp, Warning, TEXT("DDGI GetTexturePixelsStep2 - SUCCESS! Copied %d pixels"), texturePixels.Pixels.Num());
 }
 
 static void SaveFDDGITexturePixels(FArchive& Ar, FDDGITexturePixels& texturePixels, bool bSaveFormat)
@@ -1199,12 +1135,9 @@ void UDDGIVolumeComponent::Serialize(FArchive& Ar)
 			{
 				FDDGITexturePixels Irradiance, Distance, Offsets, States;
 
-				//auto CVarDDGIStaticInEditor = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RTXGI.DDGI.StaticInEditor"));
-
 				// When we are *not* cooking and ray tracing is available, copy the DDGIVolume probe texture resources
 				// to CPU memory otherwise, write out the DDGIVolume texture resources acquired at load time
 				// Also disable copying when we are static in editor
-				//if (!Ar.IsCooking() && IsRayTracingEnabled() && proxy && (!CVarDDGIStaticInEditor || !CVarDDGIStaticInEditor->GetBool()))
 				if (!Ar.IsCooking() && IsRayTracingEnabled() && proxy)
 				{
 					// Copy textures to CPU accessible texture resources
@@ -1289,15 +1222,6 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 	// Send command to the rendering thread to update the transform and other parameters
 	if (SceneProxy)
 	{
-		ProbeCounts.X = FMath::Max(1, ProbeCounts.X);
-		ProbeCounts.Y = FMath::Max(1, ProbeCounts.Y);
-		ProbeCounts.Z = FMath::Max(1, ProbeCounts.Z);
-
-		if (PrevProbeCounts.X < 1 || PrevProbeCounts.Y < 1 || PrevProbeCounts.Z < 1)
-		{
-			PrevProbeCounts = ProbeCounts;
-		}
-
 		// Update the volume component's data
 		FDDGIVolumeSceneProxy::FComponentData ComponentData;
 		ComponentData.RaysPerProbe = RaysPerProbe;
@@ -1308,20 +1232,24 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 		// Or if the distance texture is too large then revert to previous valid probe counts as well
 		volatile uint32 maxTextureSize = GetMax2DTextureDimension();
 		FIntPoint RadianceAndDistanceTextureAtlasDimensions = GetRadianceAndDistanceTextureDimensions(RaysPerProbe, ProbeCounts);
+		FIntPoint IrradianceTextureDimensions = GetIrradianceTextureDimensions(ProbeCounts);
 		FIntPoint DistanceTextureDimensions = GetDistanceTextureDimensions(ProbeCounts);
-		if (uint32(RadianceAndDistanceTextureAtlasDimensions.X) > maxTextureSize || uint32(RadianceAndDistanceTextureAtlasDimensions.Y) > maxTextureSize ||
+		if (uint32(RadianceAndDistanceTextureAtlasDimensions.X) > maxTextureSize || uint32(RadianceAndDistanceTextureAtlasDimensions.Y) > maxTextureSize || 
+			uint32(IrradianceTextureDimensions.X) > maxTextureSize || uint32(IrradianceTextureDimensions.Y) > maxTextureSize ||
 			uint32(DistanceTextureDimensions.X) > maxTextureSize || uint32(DistanceTextureDimensions.Y) > maxTextureSize)
 		{
 			ProbeCounts = PrevProbeCounts;
+			UE_LOG(LogTemp, Warning, TEXT("DDGI: ProbeCounts exceeds maximum texture dimensions (%u). Reverting to previous valid counts (%d, %d, %d)."),
+				maxTextureSize, ProbeCounts.X, ProbeCounts.Y, ProbeCounts.Z);
 		}
 		else
 		{
 			PrevProbeCounts = ProbeCounts;
 		}
 
-		ProbeCounts.X = FMath::Max(1, ProbeCounts.X);
-		ProbeCounts.Y = FMath::Max(1, ProbeCounts.Y);
-		ProbeCounts.Z = FMath::Max(1, ProbeCounts.Z);
+		ProbeCounts.X = FMath::Max(ProbeCounts.X, 1);
+		ProbeCounts.Y = FMath::Max(ProbeCounts.Y, 1);
+		ProbeCounts.Z = FMath::Max(ProbeCounts.Z, 1);
 
 		ComponentData.ProbeCounts = ProbeCounts;
 		ComponentData.ProbeDistanceExponent = probeDistanceExponent;
@@ -1454,7 +1382,6 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 		
 				if (needReallocate)
 				{
-					//DDGIProxy->TextureLoadContext.Clear();
 					DDGIProxy->ReallocateSurfaces_RenderThread(RHICmdList, IrradianceBits, DistanceBits);
 					DDGIProxy->ResetTextures_RenderThread(GraphBuilder);
 					FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Add(DDGIProxy);
@@ -1555,7 +1482,6 @@ void UDDGIVolumeComponent::DDGIClearVolumes()
 void UDDGIVolumeComponent::SendRenderDynamicData_Concurrent()
 {
 	Super::SendRenderDynamicData_Concurrent();
-	PrevProbeCounts = ProbeCounts;
 	UpdateRenderThreadData();
 }
 
@@ -1581,32 +1507,13 @@ void UDDGIVolumeComponent::DestroyRenderState_Concurrent()
 	{
 		FDDGITextureLoadContext& ComponentLoadContext = LoadContext;
 
-//		bool bStatic = RuntimeStatic;
-//#if WITH_EDITOR
-//		if (bStatic)
-//		{
-//			auto CVarDDGIStaticInEditor = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RTXGI.DDGI.StaticInEditor"));
-//			bStatic = CVarDDGIStaticInEditor && CVarDDGIStaticInEditor->GetBool();
-//		}
-//#endif
-
 		FDDGIVolumeSceneProxy* DDGIProxy = SceneProxy;
-
-		bool bProbeCountsChanged = (PrevProbeCounts != ProbeCounts);
-
 		ENQUEUE_RENDER_COMMAND(DeleteProxy)(
 			[DDGIProxy, &ComponentLoadContext](FRHICommandListImmediate& RHICmdList)
 			{
 				// If the component has textures pending load, nothing to do here. Those are the most authoritative.
 				if (!ComponentLoadContext.ReadyForLoad)
 				{
-					// If static, just reset the ready for load state
-				/*	if (bStatic)
-					{
-						ComponentLoadContext.ReadyForLoad = true;
-						ComponentLoadContext = DDGIProxy->TextureLoadContext;
-					}*/
-
 					// If the proxy has textures pending load which haven't been serviced yet, the component should take those
 					// in case it creates another proxy.
 					if (DDGIProxy->TextureLoadContext.ReadyForLoad)
@@ -1632,7 +1539,7 @@ void UDDGIVolumeComponent::DestroyRenderState_Concurrent()
 					}
 				}
 
-			delete DDGIProxy;
+				delete DDGIProxy;
 			}
 		);
 

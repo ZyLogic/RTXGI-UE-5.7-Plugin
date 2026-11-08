@@ -28,4 +28,8 @@ namespace DDGIVolumeUpdate
 
 	void DDGIInitLoadedVolumes_RenderThread(FRDGBuilder& GraphBuilder);
 	void DDGIUpdatePerFrame_RenderThread(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder);
+
+	// True when some enabled volume will be re-traced by the ray-traced update, so the renderer needs a ray tracing scene
+	// and pipeline for DDGI. Mirrors the skip rules in DDGIUpdatePerFrame_RenderThread.
+	bool AnyVolumeNeedsRayTracing_RenderThread();
 }

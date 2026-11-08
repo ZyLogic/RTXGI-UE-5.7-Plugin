@@ -1,0 +1,50 @@
+// RTXGI Probe Variability
+//
+// Reduces a volume's probe variability atlas to a single texel so the CPU can read back the average coefficient..
+//
+// The variability atlas written by ProbeBlendingCS
+// R = coefficient of variation, 
+// G = weight (1 for blended texels, 0 for inactive / rejected probes; R is always 0 where G is 0).
+
+// Unlike the SDK's ReductionCS.hlsl this uses no wave intrinsics or group-shared memory 
+//(UE gates those behind COMPILER_SUPPORTS_WAVE_, which is not sett for every shader platform ini), 
+
+#include "/Engine/Private/Common.ush"
+
+#define DDGI_REDUCTION_FOOTPRINT 8
+
+Texture2D<float4>   InputTexture;
+RWTexture2D<float4> OutputTexture;
+int2                InputSize;
+int2                OutputSize;
+
+[numthreads(8, 8, 1)]
+void DDGIProbeVariabilityReductionCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+    if (any(int2(DispatchThreadID.xy) >= OutputSize))
+    {
+        return;
+    }
+
+    int2 footprintBase = int2(DispatchThreadID.xy) * DDGI_REDUCTION_FOOTPRINT;
+
+    float sumR = 0.f;
+    float sumG = 0.f;
+    for (int y = 0; y < DDGI_REDUCTION_FOOTPRINT; y++)
+    {
+        for (int x = 0; x < DDGI_REDUCTION_FOOTPRINT; x++)
+        {
+            int2 sampleCoords = footprintBase + int2(x, y);
+            if (any(sampleCoords >= InputSize))
+            {
+                continue;
+            }
+
+            float4 value = InputTexture.Load(int3(sampleCoords, 0));
+            sumR += value.r;
+            sumG += value.g;
+        }
+    }
+
+    OutputTexture[DispatchThreadID.xy] = float4(sumR, sumG, 0.f, 0.f);
+}

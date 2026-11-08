@@ -66,6 +66,9 @@
 #include "PixelShaderUtils.h"
 #include "SceneTextureParameters.h"
 #include "IndirectLightRendering.h"
+#include "DDGIProbeVariability.h"
+#include "DataDrivenShaderPlatformInfo.h"   // Shader Execution Reordering platform support
+#include "RHIGlobals.h"
 
 #define LOCTEXT_NAMESPACE "FRTXGIPlugin"
 
@@ -89,6 +92,30 @@ static TAutoConsoleVariable<bool> CVarDDGIStatic(
 	TEXT("If true all DDGI volumes are running static"),
 	ECVF_RenderThreadSafe);
 
+#if RHI_RAYTRACING
+static TAutoConsoleVariable<int32> CVarDDGIShaderExecutionReordering(
+	TEXT("r.RTXGI.DDGI.ShaderExecutionReordering"),
+	1,
+	TEXT("Trace DDGI probe rays with NVIDIA Shader Execution Reordering (D3D12, RTX 40 series and later), which sorts hits by\n")
+	TEXT("hit shader before shading them. Only takes effect where the RHI supports it. Both probe raygen variants are part of the\n")
+	TEXT("material ray tracing pipeline on such hardware, so toggling this does not rebuild the pipeline."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarDDGIShaderExecutionReorderingFixedRayHint(
+	TEXT("r.RTXGI.DDGI.ShaderExecutionReordering.FixedRayHint"),
+	0,
+	TEXT("Experimental. 1: add a coherence hint bit that separates fixed probe rays (hit distance only, no lighting) from blended\n")
+	TEXT("rays. 0: sort by hit shader only, as Lumen and the RTXGI test harness do."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarDDGIClassificationLegacy(
+	TEXT("r.RTXGI.DDGI.Classification.Legacy"),
+	0,
+	TEXT("0: RTXGI SDK 1.3.7 probe classification: a probe is active when one of its fixed rays hits a front face inside the\n")
+	TEXT("probe's voxel.\n")
+	TEXT("1: the previous test (closest front face within 2.9 probe spacings), which keeps more probes active. For A/B comparisons."),
+	ECVF_RenderThreadSafe);
+#endif // RHI_RAYTRACING
 
 #if !RHI_RAYTRACING
 #error "RTXGI requires RHI_RAYTRACING to be enabled"
@@ -202,22 +229,17 @@ class FRayTracingRTXGIProbeUpdateRGS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FRayTracingRTXGIProbeUpdateRGS)
 	SHADER_USE_ROOT_PARAMETER_STRUCT(FRayTracingRTXGIProbeUpdateRGS, FGlobalShader)
 
-		class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY"); // If false, it will cull back face triangles. We want this on for probe relocation and to stop light leak.
-	class FEnableMaterialsDim : SHADER_PERMUTATION_BOOL("ENABLE_MATERIALS");                 // If false, forces the geo to opaque (no alpha test). We want this off for speed.
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-	class FSkyLight : SHADER_PERMUTATION_INT("RTXGI_DDGI_SKY_LIGHT_TYPE", 3);
-	class FPartialUpdateISV : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PARTIAL_UPDATE_ISV");
+	class FUseShaderExecutionReordering : SHADER_PERMUTATION_BOOL("RAY_TRACING_USE_SER");
 
-	using FPermutationDomain = TShaderPermutationDomain<FEnableTwoSidedGeometryDim, FEnableMaterialsDim, FEnableRelocation, FFormatRadiance, FFormatIrradiance, FEnableScrolling, FSkyLight, FPartialUpdateISV>;
+	using FPermutationDomain = TShaderPermutationDomain<FUseShaderExecutionReordering>;
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 
 		OutEnvironment.SetDefine(TEXT("RTXGI_DDGI_PROBE_CLASSIFICATION"), FDDGIVolumeSceneProxy::FComponentData::c_RTXGI_DDGI_PROBE_CLASSIFICATION ? 1 : 0);
+		OutEnvironment.SetDefine(TEXT("ENABLE_TWO_SIDED_GEOMETRY"), 1);
+		OutEnvironment.SetDefine(TEXT("ENABLE_MATERIALS"), 0);
 
 		// Set to 1 to be able to visualize this in the editor by typing "vis DDGIVolumeUpdateDebug" and later "vis none" to make it go away.
 		// Set to 0 to disable and deadstrip everything related
@@ -232,7 +254,20 @@ class FRayTracingRTXGIProbeUpdateRGS : public FGlobalShader
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+		if (!ShouldCompileRayTracingShadersForProject(Parameters.Platform))
+		{
+			return false;
+		}
+
+		// The SER variant uses the NVIDIA HLSL extensions; 
+		// only platforms that declare SER support compile it (i.e. PCD3D_SM6)
+		FPermutationDomain PermutationVector(Parameters.PermutationId);
+		if (PermutationVector.Get<FUseShaderExecutionReordering>() && !FDataDrivenShaderPlatformInfo::GetSupportsShaderExecutionReordering(Parameters.Platform))
+		{
+			return false;
+		}
+
+		return true;
 	}
 
 	static ERayTracingPayloadType GetRayTracingPayloadType(const int32 PermutationId)
@@ -262,6 +297,9 @@ class FRayTracingRTXGIProbeUpdateRGS : public FGlobalShader
 		SHADER_PARAMETER(float, DDGIVolume_EmissiveMultiplier)
 		SHADER_PARAMETER(int, DDGIVolume_ProbeIndexStart)
 		SHADER_PARAMETER(int, DDGIVolume_ProbeIndexCount)
+		SHADER_PARAMETER(int, DDGIVolume_PartialUpdateISV)
+		SHADER_PARAMETER(int, DDGIVolume_SkyLightType)
+		SHADER_PARAMETER(uint32, DDGIVolume_SERCoherenceHintBits)
 		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FDDGIVolumeDescGPU, DDGIVolume)
 		SHADER_PARAMETER(FVector3f, Sky_Color)
 		SHADER_PARAMETER_TEXTURE(TextureCube, Sky_Texture)
@@ -358,13 +396,8 @@ class FDDGIIrradianceBlend : public FGlobalShader
 			int32(EDDGIRaysPerProbe::n720),
 			int32(EDDGIRaysPerProbe::n864),
 			int32(EDDGIRaysPerProbe::n1008));
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-	class FPartialUpdateISV : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PARTIAL_UPDATE_ISV");
-
-	using FPermutationDomain = TShaderPermutationDomain<FRaysPerProbeEnum, FEnableRelocation, FFormatRadiance, FFormatIrradiance, FEnableScrolling, FPartialUpdateISV>;
+	
+	using FPermutationDomain = TShaderPermutationDomain<FRaysPerProbeEnum>;
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
@@ -392,13 +425,15 @@ class FDDGIIrradianceBlend : public FGlobalShader
 
 		SHADER_PARAMETER(int, ProbeIndexStart)
 		SHADER_PARAMETER(int, ProbeIndexCount)
+		SHADER_PARAMETER(int, PartialUpdateISV)
+		SHADER_PARAMETER(int, VariabilityMeasureOnly)
 
 		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FDDGIVolumeDescGPU, DDGIVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeRayDataUAV)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeProbeDataUAV)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, DDGIVolumeProbeStatesTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, DDGIProbeScrollSpace)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)  // Per unreal RDG presentation, this is deadstripped if the shader doesn't write to it
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeProbeVariabilityUAV)
 
 	END_SHADER_PARAMETER_STRUCT()
 };
@@ -418,13 +453,8 @@ class FDDGIDistanceBlend : public FGlobalShader
 			int32(EDDGIRaysPerProbe::n720),
 			int32(EDDGIRaysPerProbe::n864),
 			int32(EDDGIRaysPerProbe::n1008));
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-	class FPartialUpdateISV : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PARTIAL_UPDATE_ISV");
 
-	using FPermutationDomain = TShaderPermutationDomain<FRaysPerProbeEnum, FEnableRelocation, FFormatRadiance, FFormatIrradiance, FEnableScrolling, FPartialUpdateISV>;
+	using FPermutationDomain = TShaderPermutationDomain<FRaysPerProbeEnum>;
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
@@ -451,80 +481,21 @@ class FDDGIDistanceBlend : public FGlobalShader
 
 		SHADER_PARAMETER(int, ProbeIndexStart)
 		SHADER_PARAMETER(int, ProbeIndexCount)
+		SHADER_PARAMETER(int, PartialUpdateISV)
+		SHADER_PARAMETER(int, VariabilityMeasureOnly)
 
 		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FDDGIVolumeDescGPU, DDGIVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeRayDataUAV)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeProbeDataUAV)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, DDGIVolumeProbeStatesTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, DDGIProbeScrollSpace)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)  // Per unreal RDG presentation, this is deadstripped if the shader doesn't write to it
 
 	END_SHADER_PARAMETER_STRUCT()
 };
 
 IMPLEMENT_GLOBAL_SHADER(FDDGIDistanceBlend, "/Plugin/RTXGI/Private/SDK/ddgi/ProbeBlendingCS.usf", "DDGIProbeBlendingCS", SF_Compute);
 
-class FDDGIBorderRowUpdate : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FDDGIBorderRowUpdate)
-	SHADER_USE_PARAMETER_STRUCT(FDDGIBorderRowUpdate, FGlobalShader)
-
-		class FProbeNumTexels : SHADER_PERMUTATION_SPARSE_INT("PROBE_NUM_TEXELS",
-			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance,
-			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
-
-	using FPermutationDomain = TShaderPermutationDomain<FProbeNumTexels>;
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-
-		// needed for a typed UAV load. This already assumes we are raytracing, so should be fine.
-		OutEnvironment.CompilerFlags.Add(CFLAG_AllowTypedUAVLoads);
-	}
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
-	}
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeProbeDataUAV)
-	END_SHADER_PARAMETER_STRUCT()
-};
-
-IMPLEMENT_GLOBAL_SHADER(FDDGIBorderRowUpdate, "/Plugin/RTXGI/Private/SDK/ddgi/ProbeBorderUpdateCS.usf", "DDGIProbeBorderRowUpdateCS", SF_Compute);
-
-class FDDGIBorderColumnUpdate : public FGlobalShader
-{
-	DECLARE_GLOBAL_SHADER(FDDGIBorderColumnUpdate)
-	SHADER_USE_PARAMETER_STRUCT(FDDGIBorderColumnUpdate, FGlobalShader)
-
-		class FProbeNumTexels : SHADER_PERMUTATION_SPARSE_INT("PROBE_NUM_TEXELS",
-			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance,
-			FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
-
-	using FPermutationDomain = TShaderPermutationDomain<FProbeNumTexels>;
-
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-
-		// needed for a typed UAV load. This already assumes we are raytracing, so should be fine.
-		OutEnvironment.CompilerFlags.Add(CFLAG_AllowTypedUAVLoads);
-	}
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
-	}
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeProbeDataUAV)
-	END_SHADER_PARAMETER_STRUCT()
-};
-
-IMPLEMENT_GLOBAL_SHADER(FDDGIBorderColumnUpdate, "/Plugin/RTXGI/Private/SDK/ddgi/ProbeBorderUpdateCS.usf", "DDGIProbeBorderColumnUpdateCS", SF_Compute);
+// Border texels are copied by the blend itself, which removes and saves fouyr dispatcher per update!
 
 IMPLEMENT_UNIFORM_BUFFER_STRUCT(FDDGIVolumeDescGPU, "DDGIVolume");
 
@@ -532,12 +503,6 @@ class FDDGIProbesRelocate : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FDDGIProbesRelocate)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIProbesRelocate, FGlobalShader)
-
-		class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-
-	using FPermutationDomain = TShaderPermutationDomain<FFormatRadiance, FFormatIrradiance, FEnableScrolling>;
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
@@ -556,7 +521,6 @@ class FDDGIProbesRelocate : public FGlobalShader
 	}
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER(float, ProbeDistanceScale)
 		SHADER_PARAMETER(int, ProbeIndexStart)
 		SHADER_PARAMETER(int, ProbeIndexCount)
 
@@ -572,13 +536,6 @@ class FDDGIProbesClassify : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FDDGIProbesClassify)
 	SHADER_USE_PARAMETER_STRUCT(FDDGIProbesClassify, FGlobalShader)
-
-		class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-
-	using FPermutationDomain = TShaderPermutationDomain<FEnableRelocation, FFormatRadiance, FFormatIrradiance, FEnableScrolling>;
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
@@ -598,10 +555,13 @@ class FDDGIProbesClassify : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(int, ProbeIndexStart)
 		SHADER_PARAMETER(int, ProbeIndexCount)
+		SHADER_PARAMETER(int, ClassificationLegacy)
+		SHADER_PARAMETER(int, ClassificationMeasureOnly)
 
 		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FDDGIVolumeDescGPU, DDGIVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeRayDataUAV)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, DDGIVolumeProbeStatesUAV)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DDGIVolumeProbeVariabilityUAV)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -875,19 +835,30 @@ namespace DDGIVolumeUpdate
 	FDelegateHandle AnyRayTracingPassEnabledHandle;
 	FDelegateHandle PrepareRayTracingHandle;
 
-	void DDGIUpdateVolume_RenderThread(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, bool bPartialUpdate = false);
+	enum class EDDGIUpdateMode : uint8
+	{
+		// Round-robin window: trace, blend irradiance and distance, relocate, classify
+		Full,
+		// Forced after an infinite scrolling volume scrolled: trace and blend only the probes that wrapped
+		PartialISV,
+		// Probe Variability check of a converged volume: trace, measure irradiance variability and classification, write
+		// nothing else
+		MeasureOnly,
+	};
+
+	void DDGIUpdateVolume_RenderThread(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, EDDGIUpdateMode UpdateMode);
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 	void DDGIUpdateVolume_RenderThread_DDGIProbesTextureVis(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder);
-#endif 
+#endif
 
-	void DDGIUpdateVolume_RenderThread_RTRadiance(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureRef ProbesRadianceTex, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate);
-	void DDGIUpdateVolume_RenderThread_IrradianceBlend(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate);
-	void DDGIUpdateVolume_RenderThread_DistanceBlend(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate);
-	void DDGIUpdateVolume_RenderThread_IrradianceBorderUpdate(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy);
-	void DDGIUpdateVolume_RenderThread_DistanceBorderUpdate(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy);
-	void DDGIUpdateVolume_RenderThread_RelocateProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount);
-	void DDGIUpdateVolume_RenderThread_ClassifyProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount);
+	void DDGIUpdateVolume_RenderThread_RTRadiance(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureRef ProbesRadianceTex, FRDGTextureUAVRef ProbesRadianceUAV, bool bPartialUpdate);
+	void DDGIUpdateVolume_RenderThread_IrradianceBlend(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV, bool bPartialUpdate, bool bMeasureOnly);
+	void DDGIUpdateVolume_RenderThread_DistanceBlend(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV, bool bPartialUpdate);
+	void DDGIUpdateVolume_RenderThread_RelocateProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV);
+	void DDGIUpdateVolume_RenderThread_ClassifyProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV, bool bMeasureOnly);
+
+	bool ShouldDynamicUpdate(const FScene& Scene, const FViewInfo& View);
 
 	void PrepareRayTracingShaders(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 #endif // RHI_RAYTRACING
@@ -904,13 +875,7 @@ namespace DDGIVolumeUpdate
 		AnyRayTracingPassEnabledHandle = ARTPEDelegate.AddStatic(
 			[](bool& anyEnabled)
 		{
-//			const bool bCanEverRun = CVarDDGIForceRealtime.GetValueOnRenderThread()
-//#if WITH_EDITOR
-//				|| !CVarDDGIStaticInEditor.GetValueOnRenderThread()
-//#endif
-//				;
-//			anyEnabled |= bCanEverRun;
-				anyEnabled |= true;
+				anyEnabled |= AnyVolumeNeedsRayTracing_RenderThread();
 		}
 		);
 #endif // RHI_RAYTRACING
@@ -927,6 +892,32 @@ namespace DDGIVolumeUpdate
 		check(AnyRayTracingPassEnabledHandle.IsValid());
 		ARTPEDelegate.Remove(AnyRayTracingPassEnabledHandle);
 #endif // RHI_RAYTRACING
+	}
+
+	bool AnyVolumeNeedsRayTracing_RenderThread()
+	{
+		check(IsInRenderingThread() || IsInParallelRenderingThread());
+
+		static const TConsoleVariableData<bool>* CVarUseDDGI = IConsoleManager::Get().FindTConsoleVariableDataBool(TEXT("r.RTXGI.DDGI"));
+		if ((CVarUseDDGI && !CVarUseDDGI->GetValueOnRenderThread()) || CVarDDGIStatic.GetValueOnRenderThread())
+		{
+			return false;
+		}
+
+		for (const FDDGIVolumeSceneProxy* proxy : FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread)
+		{
+			if (!proxy || !proxy->ComponentData.EnableVolume) continue;
+
+			// Editor viewports re-trace every volume, including DDGI volumes marked as static.
+			// There is no view here, so in the editor any enabled volume counts.
+			if (GIsEditor) return true;
+
+			// Same rule as the game-view skip in DDGIUpdatePerFrame_RenderThread.
+			const EDDGIRuntimeMode Mode = proxy->ComponentData.RuntimeMode;
+			if (Mode == EDDGIRuntimeMode::Dynamic) return true;
+			if (Mode == EDDGIRuntimeMode::StaticWhenNoRayTracing && IsRayTracingEnabled()) return true;
+		}
+		return false;
 	}
 
 	void DDGIInitLoadedVolumes_RenderThread(FRDGBuilder& GraphBuilder)
@@ -970,7 +961,12 @@ namespace DDGIVolumeUpdate
 			//if (bIsValidForStatic && proxy->ComponentData.RuntimeStatic) continue;
 
 
-			if (View.bIsGameView && proxy->ComponentData.RuntimeStatic) continue;
+			// Skip the ray-traced runtime update during gameplay when the volume is Static, or when StaticWhenNoRayTracing and ray tracing isnt available.
+			const EDDGIRuntimeMode Mode = proxy->ComponentData.RuntimeMode;
+			const bool bSkipForStatic =
+				(Mode == EDDGIRuntimeMode::Static) ||
+				(Mode == EDDGIRuntimeMode::StaticWhenNoRayTracing && !IsRayTracingEnabled());
+			if (View.bIsGameView && bSkipForStatic) continue;
 
 			// Don't update the volume if it is disabled
 			if (!proxy->ComponentData.EnableVolume) continue;
@@ -985,13 +981,41 @@ namespace DDGIVolumeUpdate
 		DDGIUpdateVolume_RenderThread_DDGIProbesTextureVis(Scene, View, GraphBuilder);
 #endif
 
+		if (sceneVolumes.Num() == 0 || !ShouldDynamicUpdate(Scene, View) || !View.MaterialRayTracingData.PipelineState)
+		{
+			return;
+		}
+
+		const uint64 FrameCounter = View.Family->FrameCounter;
+		uint64& LastUpdateFrameCounter = FDDGIVolumeSceneProxy::SceneLastUpdateFrameCounter.FindOrAdd(Scene.GetWorld(), MAX_uint64);
+		if (LastUpdateFrameCounter == FrameCounter)
+		{
+			return;
+		}
+		LastUpdateFrameCounter = FrameCounter;
+
+		// resets, light and sky light changes, readbacks, convergence when probe variability is used
+		DDGIProbeVariability::BeginFrame_RenderThread(Scene, FrameCounter, sceneVolumes);
+
 		for (int index = 0; index < sceneVolumes.Num(); ++index)
 		{
 			if (sceneVolumes[index]->ComponentData.bForceUpdate)
 			{
-				DDGIUpdateVolume_RenderThread(Scene, View, GraphBuilder, sceneVolumes[index], true);
+				DDGIUpdateVolume_RenderThread(Scene, View, GraphBuilder, sceneVolumes[index], EDDGIUpdateMode::PartialISV);
 				// UpdateRenderThreadData isn't called every frame, so we need to reset it here.
 				sceneVolumes[index]->ComponentData.bForceUpdate = false;
+			}
+		}
+
+		// Converged volumes leave the weighted round robin and their probes keep their values until something awakes them
+		TArray<FDDGIVolumeSceneProxy*, TInlineAllocator<16>> roundRobinVolumes;
+		float roundRobinPriority = 0.0f;
+		for (FDDGIVolumeSceneProxy* proxy : sceneVolumes)
+		{
+			if (!DDGIProbeVariability::IsConverged(proxy))
+			{
+				roundRobinVolumes.Add(proxy);
+				roundRobinPriority += proxy->ComponentData.UpdatePriority;
 			}
 		}
 
@@ -1002,15 +1026,21 @@ namespace DDGIVolumeUpdate
 		value -= floor(value);
 
 		// Update the relevant volumes with ray tracing
-		float desiredPriority = totalPriority * value;
-		for (int index = 0; index < sceneVolumes.Num(); ++index)
+		float desiredPriority = roundRobinPriority * value;
+		for (int index = 0; index < roundRobinVolumes.Num(); ++index)
 		{
-			desiredPriority -= sceneVolumes[index]->ComponentData.UpdatePriority;
-			if (desiredPriority <= 0.0f || index == sceneVolumes.Num() - 1)
+			desiredPriority -= roundRobinVolumes[index]->ComponentData.UpdatePriority;
+			if (desiredPriority <= 0.0f || index == roundRobinVolumes.Num() - 1)
 			{
-				DDGIUpdateVolume_RenderThread(Scene, View, GraphBuilder, sceneVolumes[index]);
+				DDGIUpdateVolume_RenderThread(Scene, View, GraphBuilder, roundRobinVolumes[index], EDDGIUpdateMode::Full);
 				break;
 			}
+		}
+
+		// At most one measure-only check of a converged volume per frame
+		if (FDDGIVolumeSceneProxy* volumeToCheck = DDGIProbeVariability::SelectVolumeToCheck_RenderThread(FrameCounter, sceneVolumes))
+		{
+			DDGIUpdateVolume_RenderThread(Scene, View, GraphBuilder, volumeToCheck, EDDGIUpdateMode::MeasureOnly);
 		}
 
 #endif // RHI_RAYTRACING
@@ -1019,29 +1049,36 @@ namespace DDGIVolumeUpdate
 
 #if RHI_RAYTRACING
 
+	// Shader Execution Reordering support
+	static bool SupportsDDGIShaderExecutionReordering()
+	{
+		return GRHIGlobals.SupportsShaderExecutionReordering && FDataDrivenShaderPlatformInfo::GetSupportsShaderExecutionReordering(GMaxRHIShaderPlatform);
+	}
+
+	static bool UseDDGIShaderExecutionReordering()
+	{
+		return SupportsDDGIShaderExecutionReordering() && CVarDDGIShaderExecutionReordering.GetValueOnRenderThread() != 0;
+	}
+
 	void PrepareRayTracingShaders(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders)
 	{
 		const auto FeatureLevel = GMaxRHIFeatureLevel;
 		auto ShaderMap = GetGlobalShaderMap(FeatureLevel);
 
-		for (int i = 0; i < 16; ++i)
+		static const TConsoleVariableData<bool>* CVarUseDDGI = IConsoleManager::Get().FindTConsoleVariableDataBool(TEXT("r.RTXGI.DDGI"));
+		if (CVarUseDDGI && !CVarUseDDGI->GetValueOnRenderThread())
 		{
-			for (int j = 0; j < 3; ++j)
-			{
-				FRayTracingRTXGIProbeUpdateRGS::FPermutationDomain PermutationVector;
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableTwoSidedGeometryDim>(true);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableMaterialsDim>(false);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableRelocation>((i & 1) != 0 ? true : false);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FFormatRadiance>((i & 2) != 0 ? true : false);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FFormatIrradiance>((i & 2) != 0 ? true : false);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableScrolling>((i & 4) != 0 ? true : false);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FSkyLight>(j);
-				PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FPartialUpdateISV>((i & 8) != 0 ? true : false);
+			return;
+		}
 
-				TShaderMapRef<FRayTracingRTXGIProbeUpdateRGS> RayGenerationShader(ShaderMap, PermutationVector);
+		const int32 NumSERVariants = SupportsDDGIShaderExecutionReordering() ? 2 : 1;
+		for (int32 SERVariant = 0; SERVariant < NumSERVariants; ++SERVariant)
+		{
+			FRayTracingRTXGIProbeUpdateRGS::FPermutationDomain PermutationVector;
+			PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FUseShaderExecutionReordering>(SERVariant != 0);
+			TShaderMapRef<FRayTracingRTXGIProbeUpdateRGS> RayGenerationShader(ShaderMap, PermutationVector);
 
-				OutRayGenShaders.Add(RayGenerationShader.GetRayTracingShader());
-			}
+			OutRayGenShaders.Add(RayGenerationShader.GetRayTracingShader());
 		}
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
@@ -1091,37 +1128,108 @@ namespace DDGIVolumeUpdate
 	}
 #endif
 
-	void DDGIUpdateVolume_RenderThread(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, bool bPartialUpdate)
+	// Moved out of the radiance pass, which advanced it even for forced scrolling updates
+	static void AdvanceProbeUpdateWindow(FDDGIVolumeSceneProxy* VolProxy)
+	{
+		// Deal with probe ray budgets, and updating probes in a round robin fashion within the volume
+		int ProbeUpdateRayBudget = GetDefault<URTXGIPluginSettings>()->ProbeUpdateRayBudget;
+		int ProbeCount = GetProbeCount(VolProxy->ComponentData.ProbeCounts);
+
+		if (ProbeUpdateRayBudget == 0)
+		{
+			VolProxy->ProbeIndexStart = 0;
+			VolProxy->ProbeIndexCount = ProbeCount;
+		}
+		else
+		{
+			int ProbeUpdateBudget = ProbeUpdateRayBudget / GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
+			if (ProbeUpdateBudget < 1)
+				ProbeUpdateBudget = 1;
+			if (ProbeUpdateBudget > ProbeCount)
+				ProbeUpdateBudget = ProbeCount;
+			VolProxy->ProbeIndexStart += ProbeUpdateBudget;
+			VolProxy->ProbeIndexStart = VolProxy->ProbeIndexStart % ProbeCount;
+			VolProxy->ProbeIndexCount = ProbeUpdateBudget;
+		}
+	}
+
+	// One descriptor for every pass of an update, carrying all runtime feature values. 
+	// Based on later RTX GI SDK versions.
+	//The original NV port hand-filled a partial descriptor per pass.
+	static TRDGUniformBufferRef<FDDGIVolumeDescGPU> CreateDDGIVolumeDescUniformBuffer(FRDGBuilder& GraphBuilder, const FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, bool bLowBitDepth)
+	{
+		const FDDGIVolumeSceneProxy::FComponentData& ComponentData = VolProxy->ComponentData;
+
+		FVector3f volumeSize = ComponentData.Transform.GetScale3D() * 200.0f;
+		FVector3f probeGridSpacing;
+		probeGridSpacing.X = volumeSize.X / float(ComponentData.ProbeCounts.X);
+		probeGridSpacing.Y = volumeSize.Y / float(ComponentData.ProbeCounts.Y);
+		probeGridSpacing.Z = volumeSize.Z / float(ComponentData.ProbeCounts.Z);
+
+		FQuat4f rotation = ComponentData.Transform.GetRotation();
+
+		FDDGIVolumeDescGPU* DDGIVolumeDescGPU = GraphBuilder.AllocParameters<FDDGIVolumeDescGPU>();
+		*DDGIVolumeDescGPU = FDDGIVolumeDescGPU();
+		DDGIVolumeDescGPU->origin = ComponentData.Origin;
+		DDGIVolumeDescGPU->numRaysPerProbe = GetNumRaysPerProbe(ComponentData.RaysPerProbe);
+		DDGIVolumeDescGPU->rotation = FVector4f{ rotation.X, rotation.Y, rotation.Z, rotation.W };
+		DDGIVolumeDescGPU->probeGridSpacing = probeGridSpacing;
+		DDGIVolumeDescGPU->probeMaxRayDistance = ComponentData.ProbeMaxRayDistance;
+		DDGIVolumeDescGPU->probeGridCounts = ComponentData.ProbeCounts;
+		DDGIVolumeDescGPU->probeDistanceExponent = ComponentData.ProbeDistanceExponent;
+		DDGIVolumeDescGPU->probeHysteresis = ComponentData.ProbeHysteresis;
+		DDGIVolumeDescGPU->probeChangeThreshold = ComponentData.ProbeChangeThreshold;
+		DDGIVolumeDescGPU->probeBrightnessThreshold = ComponentData.ProbeBrightnessThreshold;
+		DDGIVolumeDescGPU->probeIrradianceEncodingGamma = ComponentData.ProbeIrradianceEncodingGamma;
+		DDGIVolumeDescGPU->probeInverseIrradianceEncodingGamma = 1.0f / ComponentData.ProbeIrradianceEncodingGamma;
+		DDGIVolumeDescGPU->probeNumIrradianceTexels = FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance;
+		DDGIVolumeDescGPU->probeNumDistanceTexels = FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance;
+		DDGIVolumeDescGPU->normalBias = ComponentData.NormalBias;
+		DDGIVolumeDescGPU->viewBias = ComponentData.ViewBias;
+		DDGIVolumeDescGPU->probeRayRotationTransform = ProbeRayRotationTransform;
+		DDGIVolumeDescGPU->volumeMovementType = ComponentData.EnableProbeScrolling ? 1 : 0;
+		DDGIVolumeDescGPU->probeScrollOffsets = ComponentData.ProbeScrollOffsets;
+		DDGIVolumeDescGPU->probeRandomRayBackfaceThreshold = ComponentData.ProbeRandomRayBackfaceThreshold;
+		DDGIVolumeDescGPU->probeFixedRayBackfaceThreshold = ComponentData.ProbeBackfaceThreshold;
+		DDGIVolumeDescGPU->probeMinFrontfaceDistance = ComponentData.ProbeMinFrontfaceDistance;
+		DDGIVolumeDescGPU->probeRelocationEnabled = (ComponentData.EnableProbeRelocation && VolProxy->ProbesOffsets.IsValid()) ? 1 : 0;
+		DDGIVolumeDescGPU->probeRayDataFormat = bLowBitDepth ? 0 : 1;
+		DDGIVolumeDescGPU->probeIrradianceFormat = bLowBitDepth ? 0 : 1;
+		DDGIVolumeDescGPU->probeVariabilityEnabled = DDGIProbeVariability::IsEnabledForVolume(VolProxy) ? 1 : 0;
+
+		return GraphBuilder.CreateUniformBuffer(DDGIVolumeDescGPU);
+	}
+
+	// The blend and classification always bind the variability UAV; 
+	// volumes without variability get a 1x1 stand-in that is never computed
+	static FRDGTextureUAVRef CreateProbeVariabilityUAV(FRDGBuilder& GraphBuilder, const FDDGIVolumeSceneProxy* VolProxy)
+	{
+		if (DDGIProbeVariability::IsEnabledForVolume(VolProxy))
+		{
+			return GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesVariability));
+		}
+
+		FRDGTextureDesc DummyDesc = FRDGTextureDesc::Create2D(FIntPoint(1, 1), FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatVariability, FClearValueBinding::None, TexCreate_ShaderResource | TexCreate_UAV);
+		return GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DummyDesc, TEXT("DDGIVariabilityDummy")));
+	}
+
+	void DDGIUpdateVolume_RenderThread(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, EDDGIUpdateMode UpdateMode)
 	{
 		check(IsInRenderingThread() || IsInParallelRenderingThread());
-
-		// === DEBUG: Run quick status check ===
-/*#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
-		static int32 DebugFrameCount = 0;
-		DebugFrameCount++;
-
-		if (DebugFrameCount % 180 == 0) // Every 3 seconds at 60fps
-		{
-			QuickDDGITest();
-			DebugDDGIVolumeStatus(Scene);
-			DebugRayTracingStatus(View);
-			DebugLightingSetup(Scene);
-			DebugRayTracingDetails();
-			DebugShaderPlatformsDetailed();
-		}
-#endif*/
-// Early out if ray tracing is not enabled
-#if ENGINE_MAJOR_VERSION < 5
-		if (!ShouldDynamicUpdate(View)) return;
-#else
-		if (!ShouldDynamicUpdate(Scene, View)) return;
-#endif
-
-		bool highBitCount = (GetDefault<URTXGIPluginSettings>()->IrradianceBits == EDDGIIrradianceBits::n32);
-
-		// ASSUMES RENDERTHREAD
-		check(IsInRenderingThread() || IsInParallelRenderingThread());
 		check(VolProxy);
+
+		// Early out if ray tracing is disabl;ed
+		if (!ShouldDynamicUpdate(Scene, View)) return;
+
+		const bool bPartialUpdate = (UpdateMode == EDDGIUpdateMode::PartialISV);
+		const bool bMeasureOnly = (UpdateMode == EDDGIUpdateMode::MeasureOnly);
+
+		const bool bLowBitDepth = IsDDGIIrradianceLowBitDepth(GetDefault<URTXGIPluginSettings>()->IrradianceBits);
+
+		if (!bPartialUpdate)
+		{
+			AdvanceProbeUpdateWindow(VolProxy);
+		}
 
 		FMatrix44f ProbeRayRotationTransform = ComputeRandomRotation();
 
@@ -1130,32 +1238,43 @@ namespace DDGIVolumeUpdate
 		FRDGTextureUAVRef ProbesRadianceUAV;
 		{
 			const FDDGIVolumeSceneProxy::FComponentData& ComponentData = VolProxy->ComponentData;
-			FRDGTextureDesc DDGIDebugOutputDesc = FRDGTextureDesc::Create2D(
+			FRDGTextureDesc DDGIRadianceDesc = FRDGTextureDesc::Create2D(
 				GetRadianceAndDistanceTextureDimensions(ComponentData.RaysPerProbe, ComponentData.ProbeCounts),
 				// This texture stores both color and distance
-				highBitCount ? FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatRadianceHighBitDepth : FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatRadianceLowBitDepth,
+				bLowBitDepth ? FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatRadianceLowBitDepth : FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatRadianceHighBitDepth,
 				FClearValueBinding::None,
 				TexCreate_ShaderResource | TexCreate_UAV
 			);
 
-			ProbesRadianceTex = GraphBuilder.CreateTexture(DDGIDebugOutputDesc, TEXT("DDGIVolumeRadiance"));
+			ProbesRadianceTex = GraphBuilder.CreateTexture(DDGIRadianceDesc, TEXT("DDGIVolumeRadiance"));
 			ProbesRadianceUAV = GraphBuilder.CreateUAV(ProbesRadianceTex);
 		}
 
-		DDGIUpdateVolume_RenderThread_RTRadiance(Scene, View, GraphBuilder, VolProxy, ProbeRayRotationTransform, ProbesRadianceTex, ProbesRadianceUAV, highBitCount, bPartialUpdate);
-		DDGIUpdateVolume_RenderThread_IrradianceBlend(View, GraphBuilder, VolProxy, ProbeRayRotationTransform, ProbesRadianceUAV, highBitCount, bPartialUpdate);
-		DDGIUpdateVolume_RenderThread_DistanceBlend(View, GraphBuilder, VolProxy, ProbeRayRotationTransform, ProbesRadianceUAV, highBitCount, bPartialUpdate);
-		DDGIUpdateVolume_RenderThread_IrradianceBorderUpdate(View, GraphBuilder, VolProxy);
-		DDGIUpdateVolume_RenderThread_DistanceBorderUpdate(View, GraphBuilder, VolProxy);
+		TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB = CreateDDGIVolumeDescUniformBuffer(GraphBuilder, VolProxy, ProbeRayRotationTransform, bLowBitDepth);
 
-		if (VolProxy->ComponentData.EnableProbeRelocation)
+		DDGIUpdateVolume_RenderThread_RTRadiance(Scene, View, GraphBuilder, VolProxy, DDGIVolumeUB, ProbesRadianceTex, ProbesRadianceUAV, bPartialUpdate);
+		DDGIUpdateVolume_RenderThread_IrradianceBlend(GraphBuilder, VolProxy, DDGIVolumeUB, ProbesRadianceUAV, bPartialUpdate, bMeasureOnly);
+
+		// A check only measures irradiance variability
+		if (!bMeasureOnly)
 		{
-			DDGIUpdateVolume_RenderThread_RelocateProbes(GraphBuilder, VolProxy, ProbeRayRotationTransform, ProbesRadianceUAV, highBitCount);
+			DDGIUpdateVolume_RenderThread_DistanceBlend(GraphBuilder, VolProxy, DDGIVolumeUB, ProbesRadianceUAV, bPartialUpdate);
 		}
 
-		if (FDDGIVolumeSceneProxy::FComponentData::c_RTXGI_DDGI_PROBE_CLASSIFICATION)
+		// Relocation and classification read the ray data of the round-robin pass. A forced scrolling update only wrote the rows of wrapped probes
+		if (!bPartialUpdate && !bMeasureOnly && VolProxy->ComponentData.EnableProbeRelocation && VolProxy->ProbesOffsets)
 		{
-			DDGIUpdateVolume_RenderThread_ClassifyProbes(GraphBuilder, VolProxy, ProbesRadianceUAV, highBitCount);
+			DDGIUpdateVolume_RenderThread_RelocateProbes(GraphBuilder, VolProxy, DDGIVolumeUB, ProbesRadianceUAV);
+		}
+
+		if (!bPartialUpdate && FDDGIVolumeSceneProxy::FComponentData::c_RTXGI_DDGI_PROBE_CLASSIFICATION && VolProxy->ProbesStates)
+		{
+			DDGIUpdateVolume_RenderThread_ClassifyProbes(GraphBuilder, VolProxy, DDGIVolumeUB, ProbesRadianceUAV, bMeasureOnly);
+		}
+
+		if (!bPartialUpdate && DDGIProbeVariability::IsEnabledForVolume(VolProxy))
+		{
+			DDGIProbeVariability::OnVolumeUpdated_RenderThread(GraphBuilder, VolProxy, View.Family->FrameCounter, bMeasureOnly);
 		}
 	}
 
@@ -1209,7 +1328,8 @@ namespace DDGIVolumeUpdate
 		PassParameters->TLAS = View.RayTracingScene.RayTracingSceneSRV;
 #else
 		//PassParameters->TLAS = View.GetRayTracingSceneLayerViewChecked(ERayTracingSceneLayer::Base);
-		PassParameters->TLAS = View.Family->Scene->GetRenderScene()->RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base);
+		// The ray tracing scene's layer views are per scene view since 5.7.
+		PassParameters->TLAS = View.Family->Scene->GetRenderScene()->RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base, View.GetRayTracingSceneViewHandle());
 #endif
 		PassParameters->RadianceOutput = ProbeVisUAV;
 		PassParameters->FrameRandomSeed = GFrameNumber;
@@ -1266,58 +1386,30 @@ namespace DDGIVolumeUpdate
 	}
 #endif //!(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 
-	void DDGIUpdateVolume_RenderThread_RTRadiance(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureRef ProbesRadianceTex, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate = false)
+	void DDGIUpdateVolume_RenderThread_RTRadiance(const FScene& Scene, const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureRef ProbesRadianceTex, FRDGTextureUAVRef ProbesRadianceUAV, bool bPartialUpdate)
 	{
-		// Deal with probe ray budgets, and updating probes in a round robin fashion within the volume
-		int ProbeUpdateRayBudget = GetDefault<URTXGIPluginSettings>()->ProbeUpdateRayBudget;
-		int ProbeCount = GetProbeCount(VolProxy->ComponentData.ProbeCounts);
-
-		if (ProbeUpdateRayBudget == 0)
-		{
-			VolProxy->ProbeIndexStart = 0;
-			VolProxy->ProbeIndexCount = ProbeCount;
-		}
-		else
-		{
-			int ProbeUpdateBudget = ProbeUpdateRayBudget / GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
-			if (ProbeUpdateBudget < 1)
-				ProbeUpdateBudget = 1;
-			if (ProbeUpdateBudget > ProbeCount)
-				ProbeUpdateBudget = ProbeCount;
-			VolProxy->ProbeIndexStart += ProbeUpdateBudget;
-			VolProxy->ProbeIndexStart = VolProxy->ProbeIndexStart % ProbeCount;
-			VolProxy->ProbeIndexCount = ProbeUpdateBudget;
-		}
-
-		//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
 		auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
+		// Both variants are in the material pipeline whenever SER is supported (PrepareRayTracingShaders)
+		const bool bUseSER = UseDDGIShaderExecutionReordering();
+
 		FRayTracingRTXGIProbeUpdateRGS::FPermutationDomain PermutationVector;
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableTwoSidedGeometryDim>(true);
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableMaterialsDim>(false);
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableRelocation>(VolProxy->ComponentData.EnableProbeRelocation);
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FFormatRadiance>(highBitCount);
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FFormatIrradiance>(highBitCount);
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FEnableScrolling>(VolProxy->ComponentData.EnableProbeScrolling);
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FSkyLight>(int(VolProxy->ComponentData.SkyLightTypeOnRayMiss));
-		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FPartialUpdateISV>(bPartialUpdate);
+		PermutationVector.Set<FRayTracingRTXGIProbeUpdateRGS::FUseShaderExecutionReordering>(bUseSER);
 		TShaderMapRef<FRayTracingRTXGIProbeUpdateRGS> RayGenerationShader(ShaderMap, PermutationVector);
 
-		FRayTracingRTXGIProbeUpdateRGS::FParameters DefaultPassParameters;
 		FRayTracingRTXGIProbeUpdateRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRayTracingRTXGIProbeUpdateRGS::FParameters>();
-		*PassParameters = DefaultPassParameters;
+		*PassParameters = FRayTracingRTXGIProbeUpdateRGS::FParameters();
 
 		PassParameters->Scene = GetSceneUniformBufferRef(GraphBuilder, View);
 		PassParameters->NaniteRayTracing = Nanite::GetPublicGlobalRayTracingUniformBuffer();
 
-		//PassParameters->TLAS = Scene.RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base, View.GetRayTracingSceneViewHandle());
-		PassParameters->TLAS = Scene.RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base);
+		PassParameters->TLAS = Scene.RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base, View.GetRayTracingSceneViewHandle());
 		PassParameters->RadianceOutput = ProbesRadianceUAV;
 		PassParameters->FrameRandomSeed = GFrameNumber;
 		PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
 
-		if (VolProxy->ComponentData.EnableProbeScrolling)
-			PassParameters->DDGIProbeScrollSpace = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesSpace));
+		// Always bound: the shader reads it at runtime for forced scrolling updates
+		PassParameters->DDGIProbeScrollSpace = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesSpace));
 
 		// skylight parameters
 		if (Scene.SkyLight && Scene.SkyLight->ProcessedTexture)
@@ -1346,36 +1438,15 @@ namespace DDGIVolumeUpdate
 			PassParameters->DDGIVolume_EmissiveMultiplier = VolProxy->ComponentData.EmissiveMultiplier;
 			PassParameters->DDGIVolume_ProbeIndexStart = VolProxy->ProbeIndexStart;
 			PassParameters->DDGIVolume_ProbeIndexCount = VolProxy->ProbeIndexCount;
+			PassParameters->DDGIVolume_PartialUpdateISV = bPartialUpdate ? 1 : 0;
+			PassParameters->DDGIVolume_SkyLightType = int(VolProxy->ComponentData.SkyLightTypeOnRayMiss);
+			// 0 sorts by hit shader only
+			PassParameters->DDGIVolume_SERCoherenceHintBits = (bUseSER && CVarDDGIShaderExecutionReorderingFixedRayHint.GetValueOnRenderThread() != 0) ? 1 : 0;
 
-			// calculate grid spacing based on size (scale) and probe count
-			// regarding the *200: the scale is the radius so we need to double it. There is also an implict * 100 of the basic box.
-			FVector3f volumeSize = static_cast<FVector3f>(VolProxy->ComponentData.Transform.GetScale3D()) * 200.0f;
-			FVector3f probeGridSpacing;
-			probeGridSpacing.X = volumeSize.X / float(VolProxy->ComponentData.ProbeCounts.X);
-			probeGridSpacing.Y = volumeSize.Y / float(VolProxy->ComponentData.ProbeCounts.Y);
-			probeGridSpacing.Z = volumeSize.Z / float(VolProxy->ComponentData.ProbeCounts.Z);
-
-			FDDGIVolumeDescGPU DefaultDDGIVolumeDescGPU;
-			FDDGIVolumeDescGPU* DDGIVolumeDescGPU = GraphBuilder.AllocParameters<FDDGIVolumeDescGPU>();
-			*DDGIVolumeDescGPU = DefaultDDGIVolumeDescGPU;
-			DDGIVolumeDescGPU->origin = VolProxy->ComponentData.Origin;
-			FQuat4f rotation = static_cast<FQuat4f>(VolProxy->ComponentData.Transform.GetRotation());
-			DDGIVolumeDescGPU->rotation = FVector4f{ rotation.X, rotation.Y, rotation.Z, rotation.W };
-			DDGIVolumeDescGPU->probeMaxRayDistance = VolProxy->ComponentData.ProbeMaxRayDistance;
-			DDGIVolumeDescGPU->probeGridCounts = VolProxy->ComponentData.ProbeCounts;
-			DDGIVolumeDescGPU->probeRayRotationTransform = ProbeRayRotationTransform;
-			DDGIVolumeDescGPU->numRaysPerProbe = GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
-			DDGIVolumeDescGPU->probeGridSpacing = probeGridSpacing;
-			DDGIVolumeDescGPU->probeNumIrradianceTexels = FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance;
-			DDGIVolumeDescGPU->probeNumDistanceTexels = FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance;
-			DDGIVolumeDescGPU->probeIrradianceEncodingGamma = VolProxy->ComponentData.ProbeIrradianceEncodingGamma;
-			DDGIVolumeDescGPU->normalBias = VolProxy->ComponentData.NormalBias;
-			DDGIVolumeDescGPU->viewBias = VolProxy->ComponentData.ViewBias;
-			DDGIVolumeDescGPU->probeScrollOffsets = VolProxy->ComponentData.ProbeScrollOffsets;
-
-			PassParameters->DDGIVolume = GraphBuilder.CreateUniformBuffer(DDGIVolumeDescGPU);
+			PassParameters->DDGIVolume = DDGIVolumeUB;
 		}
 
+		// Written when the raygen is compiled with DDGIVolumeUpdateDebug 
 		FRDGTextureDesc DDGIDebugOutputDesc = FRDGTextureDesc::Create2D(
 			ProbesRadianceTex->Desc.Extent,
 			ProbesRadianceTex->Desc.Format,
@@ -1385,20 +1456,14 @@ namespace DDGIVolumeUpdate
 		PassParameters->DebugOutput = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DDGIDebugOutputDesc, TEXT("DDGIVolumeUpdateDebug")));
 
 		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-		PassParameters->RayTracingLightGridUniformBuffer = View.RayTracingLightGridUniformBuffer;
 		FIntPoint DispatchSize = ProbesRadianceTex->Desc.Extent;
 
 		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("DDGI RTRadiance %dx%d", DispatchSize.X, DispatchSize.Y),
+			RDG_EVENT_NAME("DDGI RTRadiance %dx%d%s", DispatchSize.X, DispatchSize.Y, bUseSER ? TEXT(" (SER)") : TEXT("")),
 			PassParameters,
 			ERDGPassFlags::Compute,
-#if ENGINE_MAJOR_VERSION < 5
-			[PassParameters, RayTracingSceneRHI = View.RayTracingScene.RayTracingSceneRHI, &View, RayGenerationShader, DispatchSize, ProbesRadianceTex]
-			(FRHICommandList& RHICmdList)
-#else
 			[PassParameters, &View, RayGenerationShader, DispatchSize]
 			(FRHICommandListImmediate& RHICmdList)
-#endif
 		{
 			if (View.MaterialRayTracingData.PipelineState)
 			{
@@ -1430,147 +1495,63 @@ namespace DDGIVolumeUpdate
 		);
 	}
 
-	void DDGIUpdateVolume_RenderThread_IrradianceBlend(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate = false)
+	void DDGIUpdateVolume_RenderThread_IrradianceBlend(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV, bool bPartialUpdate, bool bMeasureOnly)
 	{
-		//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
 		FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 		FDDGIIrradianceBlend::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FDDGIIrradianceBlend::FRaysPerProbeEnum>(int(VolProxy->ComponentData.RaysPerProbe));
-		PermutationVector.Set<FDDGIIrradianceBlend::FEnableRelocation>(VolProxy->ComponentData.EnableProbeRelocation);
-		PermutationVector.Set<FDDGIIrradianceBlend::FFormatRadiance>(highBitCount);
-		PermutationVector.Set<FDDGIIrradianceBlend::FFormatIrradiance>(highBitCount);
-		PermutationVector.Set<FDDGIIrradianceBlend::FEnableScrolling>(VolProxy->ComponentData.EnableProbeScrolling);
-		PermutationVector.Set<FDDGIIrradianceBlend::FPartialUpdateISV>(bPartialUpdate);
 		TShaderMapRef<FDDGIIrradianceBlend> ComputeShader(ShaderMap, PermutationVector);
 
-		// calculate grid spacing based on size (scale) and probe count
-		// regarding the *200: the scale is the radius so we need to double it. There is also an implict * 100 of the basic box.
-		FVector3f volumeSize = VolProxy->ComponentData.Transform.GetScale3D() * 200.0f;
-		FVector3f probeGridSpacing;
-		probeGridSpacing.X = volumeSize.X / float(VolProxy->ComponentData.ProbeCounts.X);
-		probeGridSpacing.Y = volumeSize.Y / float(VolProxy->ComponentData.ProbeCounts.Y);
-		probeGridSpacing.Z = volumeSize.Z / float(VolProxy->ComponentData.ProbeCounts.Z);
-
-		// set up the shader parameters
-		FDDGIVolumeDescGPU DefaultDDGIVolumeDescGPU;
-		FDDGIVolumeDescGPU* DDGIVolumeDescGPU = GraphBuilder.AllocParameters<FDDGIVolumeDescGPU>();
-		*DDGIVolumeDescGPU = DefaultDDGIVolumeDescGPU;
-		DDGIVolumeDescGPU->probeGridSpacing = probeGridSpacing;
-		DDGIVolumeDescGPU->probeGridCounts = VolProxy->ComponentData.ProbeCounts;
-		DDGIVolumeDescGPU->numRaysPerProbe = GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
-		DDGIVolumeDescGPU->probeRayRotationTransform = ProbeRayRotationTransform;
-		DDGIVolumeDescGPU->probeDistanceExponent = VolProxy->ComponentData.ProbeDistanceExponent;
-		DDGIVolumeDescGPU->probeInverseIrradianceEncodingGamma = 1.0f / VolProxy->ComponentData.ProbeIrradianceEncodingGamma;
-		DDGIVolumeDescGPU->probeHysteresis = VolProxy->ComponentData.ProbeHysteresis;
-		DDGIVolumeDescGPU->probeChangeThreshold = VolProxy->ComponentData.ProbeChangeThreshold;
-		DDGIVolumeDescGPU->probeBrightnessThreshold = VolProxy->ComponentData.ProbeBrightnessThreshold;
-		DDGIVolumeDescGPU->probeScrollOffsets = VolProxy->ComponentData.ProbeScrollOffsets;
-
-		FDDGIIrradianceBlend::FParameters DefaultPassParameters;
 		FDDGIIrradianceBlend::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIIrradianceBlend::FParameters>();
-		*PassParameters = DefaultPassParameters;
+		*PassParameters = FDDGIIrradianceBlend::FParameters();
 
 		PassParameters->ProbeIndexStart = VolProxy->ProbeIndexStart;
 		PassParameters->ProbeIndexCount = VolProxy->ProbeIndexCount;
+		PassParameters->PartialUpdateISV = bPartialUpdate ? 1 : 0;
+		PassParameters->VariabilityMeasureOnly = bMeasureOnly ? 1 : 0;
 
-		PassParameters->DDGIVolume = GraphBuilder.CreateUniformBuffer(DDGIVolumeDescGPU);
+		PassParameters->DDGIVolume = DDGIVolumeUB;
 
 		PassParameters->DDGIVolumeRayDataUAV = ProbesRadianceUAV;
 		PassParameters->DDGIVolumeProbeDataUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesIrradiance));
 		PassParameters->DDGIVolumeProbeStatesTexture = RegisterExternalTextureWithFallback(GraphBuilder, VolProxy->ProbesStates, GSystemTextures.BlackDummy);
+		PassParameters->DDGIProbeScrollSpace = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesSpace));
+		PassParameters->DDGIVolumeProbeVariabilityUAV = CreateProbeVariabilityUAV(GraphBuilder, VolProxy);
 
-		if (VolProxy->ComponentData.EnableProbeScrolling)
-			PassParameters->DDGIProbeScrollSpace = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesSpace));
-
-		FRDGTextureDesc DDGIDebugOutputDesc = FRDGTextureDesc::Create2D(
-#if ENGINE_MAJOR_VERSION < 5
-			VolProxy->ProbesIrradiance->GetTargetableRHI()->GetTexture2D()->GetSizeXY(),
-			VolProxy->ProbesIrradiance->GetTargetableRHI()->GetFormat(),
-#else
-			VolProxy->ProbesIrradiance->GetRHI()->GetTexture2D()->GetSizeXY(),
-			VolProxy->ProbesIrradiance->GetRHI()->GetFormat(),
-#endif
-			FClearValueBinding::None,
-			TexCreate_ShaderResource | TexCreate_UAV
-		);
-		PassParameters->DebugOutput = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DDGIDebugOutputDesc, TEXT("DDGIIrradianceBlendDebug")));
-
+		// One thread group per probe, border included
 		FIntPoint ProbeCount2D = Get2DProbeCount(VolProxy->ComponentData.ProbeCounts);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
-			RDG_EVENT_NAME("DDGI Radiance Blend"),
+			RDG_EVENT_NAME("DDGI Radiance Blend%s", bMeasureOnly ? TEXT(" (Variability Check)") : TEXT("")),
 			ComputeShader,
 			PassParameters,
 			FIntVector(ProbeCount2D.X, ProbeCount2D.Y, 1)
 		);
 	}
 
-	void DDGIUpdateVolume_RenderThread_DistanceBlend(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount, bool bPartialUpdate = false)
+	void DDGIUpdateVolume_RenderThread_DistanceBlend(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV, bool bPartialUpdate)
 	{
-		//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
 		FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 		FDDGIDistanceBlend::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FDDGIDistanceBlend::FRaysPerProbeEnum>(int(VolProxy->ComponentData.RaysPerProbe));
-		PermutationVector.Set<FDDGIDistanceBlend::FEnableRelocation>(int(VolProxy->ComponentData.EnableProbeRelocation));
-		PermutationVector.Set<FDDGIDistanceBlend::FFormatRadiance>(highBitCount);
-		PermutationVector.Set<FDDGIDistanceBlend::FFormatIrradiance>(highBitCount);
-		PermutationVector.Set<FDDGIDistanceBlend::FEnableScrolling>(int(VolProxy->ComponentData.EnableProbeScrolling));
-		PermutationVector.Set<FDDGIDistanceBlend::FPartialUpdateISV>(bPartialUpdate);
 		TShaderMapRef<FDDGIDistanceBlend> ComputeShader(ShaderMap, PermutationVector);
 
-		// calculate grid spacing based on size (scale) and probe count
-		// regarding the *200: the scale is the radius so we need to double it. There is also an implict * 100 of the basic box.
-		FVector3f volumeSize = VolProxy->ComponentData.Transform.GetScale3D() * 200.0f;
-		FVector3f probeGridSpacing;
-		probeGridSpacing.X = volumeSize.X / float(VolProxy->ComponentData.ProbeCounts.X);
-		probeGridSpacing.Y = volumeSize.Y / float(VolProxy->ComponentData.ProbeCounts.Y);
-		probeGridSpacing.Z = volumeSize.Z / float(VolProxy->ComponentData.ProbeCounts.Z);
-
-		FDDGIVolumeDescGPU DefaultDDGIVolumeDescGPU;
-		FDDGIVolumeDescGPU* DDGIVolumeDescGPU = GraphBuilder.AllocParameters<FDDGIVolumeDescGPU>();
-		*DDGIVolumeDescGPU = DefaultDDGIVolumeDescGPU;
-		DDGIVolumeDescGPU->probeGridSpacing = probeGridSpacing;
-		DDGIVolumeDescGPU->probeGridCounts = VolProxy->ComponentData.ProbeCounts;
-		DDGIVolumeDescGPU->numRaysPerProbe = GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
-		DDGIVolumeDescGPU->probeRayRotationTransform = ProbeRayRotationTransform;
-		DDGIVolumeDescGPU->probeDistanceExponent = VolProxy->ComponentData.ProbeDistanceExponent;
-		DDGIVolumeDescGPU->probeInverseIrradianceEncodingGamma = 1.0f / VolProxy->ComponentData.ProbeIrradianceEncodingGamma;
-		DDGIVolumeDescGPU->probeHysteresis = VolProxy->ComponentData.ProbeHysteresis;
-		DDGIVolumeDescGPU->probeChangeThreshold = VolProxy->ComponentData.ProbeChangeThreshold;
-		DDGIVolumeDescGPU->probeBrightnessThreshold = VolProxy->ComponentData.ProbeBrightnessThreshold;
-		DDGIVolumeDescGPU->probeScrollOffsets = VolProxy->ComponentData.ProbeScrollOffsets;
-
-		FDDGIDistanceBlend::FParameters DefaultPassParameters;
 		FDDGIDistanceBlend::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIDistanceBlend::FParameters>();
-		*PassParameters = DefaultPassParameters;
+		*PassParameters = FDDGIDistanceBlend::FParameters();
 
 		PassParameters->ProbeIndexStart = VolProxy->ProbeIndexStart;
 		PassParameters->ProbeIndexCount = VolProxy->ProbeIndexCount;
+		PassParameters->PartialUpdateISV = bPartialUpdate ? 1 : 0;
+		PassParameters->VariabilityMeasureOnly = 0;
 
-		PassParameters->DDGIVolume = GraphBuilder.CreateUniformBuffer(DDGIVolumeDescGPU);
+		PassParameters->DDGIVolume = DDGIVolumeUB;
 
 		PassParameters->DDGIVolumeRayDataUAV = ProbesRadianceUAV;
 		PassParameters->DDGIVolumeProbeDataUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesDistance));
 		PassParameters->DDGIVolumeProbeStatesTexture = RegisterExternalTextureWithFallback(GraphBuilder, VolProxy->ProbesStates, GSystemTextures.BlackDummy);
+		PassParameters->DDGIProbeScrollSpace = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesSpace));
 
-		if (VolProxy->ComponentData.EnableProbeScrolling)
-			PassParameters->DDGIProbeScrollSpace = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesSpace));
-
-		FRDGTextureDesc DDGIDebugOutputDesc = FRDGTextureDesc::Create2D(
-#if ENGINE_MAJOR_VERSION < 5
-			VolProxy->ProbesDistance->GetTargetableRHI()->GetTexture2D()->GetSizeXY(),
-			VolProxy->ProbesDistance->GetTargetableRHI()->GetFormat(),
-#else
-			VolProxy->ProbesDistance->GetRHI()->GetTexture2D()->GetSizeXY(),
-			VolProxy->ProbesDistance->GetRHI()->GetFormat(),
-#endif
-			FClearValueBinding::None,
-			TexCreate_ShaderResource | TexCreate_UAV
-		);
-		PassParameters->DebugOutput = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DDGIDebugOutputDesc, TEXT("DDGIDistanceBlendDebug")));
-
+		// One thread group per probe, border included
 		FIntPoint ProbeCount2D = Get2DProbeCount(VolProxy->ComponentData.ProbeCounts);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
@@ -1581,262 +1562,62 @@ namespace DDGIVolumeUpdate
 		);
 	}
 
-	void DDGIUpdateVolume_RenderThread_IrradianceBorderUpdate(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy)
+	void DDGIUpdateVolume_RenderThread_RelocateProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV)
 	{
-		float groupSize = 8.0f;
-		FIntPoint ProbeCount2D = Get2DProbeCount(VolProxy->ComponentData.ProbeCounts);
-		FIntPoint IrradianceTextureDimensions = GetIrradianceTextureDimensions(VolProxy->ComponentData.ProbeCounts);
-
-		// Row
-		{
-			//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
-			FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-			FDDGIBorderRowUpdate::FPermutationDomain PermutationVector;
-			PermutationVector.Set<FDDGIBorderRowUpdate::FProbeNumTexels>(FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance);
-			TShaderMapRef<FDDGIBorderRowUpdate> ComputeShader(ShaderMap, PermutationVector);
-
-			FDDGIBorderRowUpdate::FParameters DefaultPassParameters;
-			FDDGIBorderRowUpdate::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIBorderRowUpdate::FParameters>();
-			*PassParameters = DefaultPassParameters;
-
-			PassParameters->DDGIVolumeProbeDataUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesIrradiance));
-
-			uint32 numThreadsX = IrradianceTextureDimensions.X;
-			uint32 numThreadsY = ProbeCount2D.Y;
-			uint32 numGroupsX = (uint32)ceil((float)numThreadsX / groupSize);
-			uint32 numGroupsY = (uint32)ceil((float)numThreadsY / groupSize);
-
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("DDGI Irradiance Border Update Row"),
-				ComputeShader,
-				PassParameters,
-				FIntVector(numGroupsX, numGroupsY, 1)
-			);
-		}
-
-		// Column
-		{
-			//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
-			FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-			FDDGIBorderColumnUpdate::FPermutationDomain PermutationVector;
-			PermutationVector.Set<FDDGIBorderColumnUpdate::FProbeNumTexels>(FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance);
-			TShaderMapRef<FDDGIBorderColumnUpdate> ComputeShader(ShaderMap, PermutationVector);
-
-			FDDGIBorderColumnUpdate::FParameters DefaultPassParameters;
-			FDDGIBorderColumnUpdate::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIBorderColumnUpdate::FParameters>();
-			*PassParameters = DefaultPassParameters;
-
-			PassParameters->DDGIVolumeProbeDataUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesIrradiance));
-
-			uint32 numThreadsX = (ProbeCount2D.X * 2);
-			uint32 numThreadsY = IrradianceTextureDimensions.Y;
-			uint32 numGroupsX = (uint32)ceil((float)numThreadsX / groupSize);
-			uint32 numGroupsY = (uint32)ceil((float)numThreadsY / groupSize);
-
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("DDGI Irradiance Border Update Column"),
-				ComputeShader,
-				PassParameters,
-				FIntVector(numGroupsX, numGroupsY, 1)
-			);
-		}
-	}
-
-	void DDGIUpdateVolume_RenderThread_DistanceBorderUpdate(const FViewInfo& View, FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy)
-	{
-		float groupSize = 8.0f;
-		FIntPoint ProbeCount2D = Get2DProbeCount(VolProxy->ComponentData.ProbeCounts);
-		FIntPoint DistanceTextureDimensions = GetDistanceTextureDimensions(VolProxy->ComponentData.ProbeCounts);
-
-		// Row
-		{
-			//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
-			FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-			FDDGIBorderRowUpdate::FPermutationDomain PermutationVector;
-			PermutationVector.Set<FDDGIBorderRowUpdate::FProbeNumTexels>(FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
-			TShaderMapRef<FDDGIBorderRowUpdate> ComputeShader(ShaderMap, PermutationVector);
-
-			FDDGIBorderRowUpdate::FParameters DefaultPassParameters;
-			FDDGIBorderRowUpdate::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIBorderRowUpdate::FParameters>();
-			*PassParameters = DefaultPassParameters;
-
-			PassParameters->DDGIVolumeProbeDataUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesDistance));
-
-			uint32 numThreadsX = DistanceTextureDimensions.X;
-			uint32 numThreadsY = ProbeCount2D.Y;
-			uint32 numGroupsX = (uint32)ceil((float)numThreadsX / groupSize);
-			uint32 numGroupsY = (uint32)ceil((float)numThreadsY / groupSize);
-
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("DDGI Distance Border Update Row"),
-				ComputeShader,
-				PassParameters,
-				FIntVector(numGroupsX, numGroupsY, 1)
-			);
-		}
-
-		// Column
-		{
-			//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
-			FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-			FDDGIBorderColumnUpdate::FPermutationDomain PermutationVector;
-			PermutationVector.Set<FDDGIBorderColumnUpdate::FProbeNumTexels>(FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsDistance);
-			TShaderMapRef<FDDGIBorderColumnUpdate> ComputeShader(ShaderMap, PermutationVector);
-
-			FDDGIBorderColumnUpdate::FParameters DefaultPassParameters;
-			FDDGIBorderColumnUpdate::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIBorderColumnUpdate::FParameters>();
-			*PassParameters = DefaultPassParameters;
-
-			PassParameters->DDGIVolumeProbeDataUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesDistance));
-
-			uint32 numThreadsX = (ProbeCount2D.X * 2);
-			uint32 numThreadsY = DistanceTextureDimensions.Y;
-			uint32 numGroupsX = (uint32)ceil((float)numThreadsX / groupSize);
-			uint32 numGroupsY = (uint32)ceil((float)numThreadsY / groupSize);
-
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("DDGI Distance Border Update Column"),
-				ComputeShader,
-				PassParameters,
-				FIntVector(numGroupsX, numGroupsY, 1)
-			);
-		}
-	}
-
-	void DDGIUpdateVolume_RenderThread_RelocateProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, const FMatrix44f& ProbeRayRotationTransform, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount)
-	{
-		FDDGIProbesRelocate::FPermutationDomain PermutationVector;
-		PermutationVector.Set<FDDGIProbesRelocate::FFormatRadiance>(highBitCount);
-		PermutationVector.Set<FDDGIProbesRelocate::FFormatIrradiance>(highBitCount);
-		PermutationVector.Set<FDDGIProbesRelocate::FEnableScrolling>(VolProxy->ComponentData.EnableProbeScrolling);
-		//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
 		FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-		TShaderMapRef<FDDGIProbesRelocate> ComputeShader(ShaderMap, PermutationVector);
+		TShaderMapRef<FDDGIProbesRelocate> ComputeShader(ShaderMap);
 
-		// calculate grid spacing based on size (scale) and probe count
-		// regarding the *200: the scale is the radius so we need to double it. There is also an implict * 100 of the basic box.
-		FVector3f volumeSize = VolProxy->ComponentData.Transform.GetScale3D() * 200.0f;
-		FVector3f probeGridSpacing;
-		probeGridSpacing.X = volumeSize.X / float(VolProxy->ComponentData.ProbeCounts.X);
-		probeGridSpacing.Y = volumeSize.Y / float(VolProxy->ComponentData.ProbeCounts.Y);
-		probeGridSpacing.Z = volumeSize.Z / float(VolProxy->ComponentData.ProbeCounts.Z);
-
-		FDDGIVolumeDescGPU DefaultDDGIVolumeDescGPU;
-		FDDGIVolumeDescGPU* DDGIVolumeDescGPU = GraphBuilder.AllocParameters<FDDGIVolumeDescGPU>();
-		*DDGIVolumeDescGPU = DefaultDDGIVolumeDescGPU;
-		DDGIVolumeDescGPU->probeGridSpacing = probeGridSpacing;
-		DDGIVolumeDescGPU->probeGridCounts = VolProxy->ComponentData.ProbeCounts;
-		DDGIVolumeDescGPU->numRaysPerProbe = GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
-		DDGIVolumeDescGPU->probeScrollOffsets = VolProxy->ComponentData.ProbeScrollOffsets;
-		DDGIVolumeDescGPU->probeBackfaceThreshold = VolProxy->ComponentData.ProbeBackfaceThreshold;
-		DDGIVolumeDescGPU->probeRayRotationTransform = ProbeRayRotationTransform;
-		DDGIVolumeDescGPU->probeMinFrontfaceDistance = VolProxy->ComponentData.ProbeMinFrontfaceDistance;
-
-		FDDGIProbesRelocate::FParameters DefaultPassParameters;
 		FDDGIProbesRelocate::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIProbesRelocate::FParameters>();
-		*PassParameters = DefaultPassParameters;
-
-		// run every frame with full distance scale value for continuous relocation
-		PassParameters->ProbeDistanceScale = 1.0f;
+		*PassParameters = FDDGIProbesRelocate::FParameters();
 
 		PassParameters->ProbeIndexStart = VolProxy->ProbeIndexStart;
 		PassParameters->ProbeIndexCount = VolProxy->ProbeIndexCount;
 
-		PassParameters->DDGIVolume = GraphBuilder.CreateUniformBuffer(DDGIVolumeDescGPU);
+		PassParameters->DDGIVolume = DDGIVolumeUB;
 
 		PassParameters->DDGIVolumeRayDataUAV = ProbesRadianceUAV;
 		// This resource is required if this method was called.
 		check(VolProxy->ProbesOffsets);
 		PassParameters->DDGIVolumeProbeOffsetsUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesOffsets));
 
-		float groupSizeX = 8.f;
-		float groupSizeY = 4.f;
-
 		FIntPoint ProbeCount2D = Get2DProbeCount(VolProxy->ComponentData.ProbeCounts);
-		uint32 numThreadsX = ProbeCount2D.X;
-		uint32 numThreadsY = ProbeCount2D.Y;
-		uint32 numGroupsX = (uint32)ceil((float)numThreadsX / groupSizeX);
-		uint32 numGroupsY = (uint32)ceil((float)numThreadsY / groupSizeY);
-
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
 			RDG_EVENT_NAME("DDGI Probe Relocation"),
 			ComputeShader,
 			PassParameters,
-			FIntVector(numGroupsX, numGroupsY, 1)
+			FComputeShaderUtils::GetGroupCount(ProbeCount2D, FIntPoint(8, 4))
 		);
 	}
 
-	void DDGIUpdateVolume_RenderThread_ClassifyProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, FRDGTextureUAVRef ProbesRadianceUAV, bool highBitCount)
+	void DDGIUpdateVolume_RenderThread_ClassifyProbes(FRDGBuilder& GraphBuilder, FDDGIVolumeSceneProxy* VolProxy, TRDGUniformBufferRef<FDDGIVolumeDescGPU> DDGIVolumeUB, FRDGTextureUAVRef ProbesRadianceUAV, bool bMeasureOnly)
 	{
-		// get the permuted shader
-		FDDGIProbesClassify::FPermutationDomain PermutationVector;
-		PermutationVector.Set<FDDGIProbesClassify::FEnableRelocation>(VolProxy->ComponentData.EnableProbeRelocation);
-		PermutationVector.Set <FDDGIProbesClassify::FFormatRadiance>(highBitCount);
-		PermutationVector.Set <FDDGIProbesClassify::FFormatIrradiance>(highBitCount);
-		PermutationVector.Set <FDDGIProbesClassify::FEnableScrolling>(VolProxy->ComponentData.EnableProbeScrolling);
-		//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
 		FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-		TShaderMapRef<FDDGIProbesClassify> ComputeShader(ShaderMap, PermutationVector);
+		TShaderMapRef<FDDGIProbesClassify> ComputeShader(ShaderMap);
 
-		// calculate grid spacing based on size (scale) and probe count
-		// regarding the *200: the scale is the radius so we need to double it. There is also an implict * 100 of the basic box.
-		FVector3f volumeSize = VolProxy->ComponentData.Transform.GetScale3D() * 200.0f;
-		FVector3f probeGridSpacing;
-		probeGridSpacing.X = volumeSize.X / float(VolProxy->ComponentData.ProbeCounts.X);
-		probeGridSpacing.Y = volumeSize.Y / float(VolProxy->ComponentData.ProbeCounts.Y);
-		probeGridSpacing.Z = volumeSize.Z / float(VolProxy->ComponentData.ProbeCounts.Z);
-
-		// set up the shader parameters
-		FDDGIVolumeDescGPU DefaultDDGIVolumeDescGPU;
-		FDDGIVolumeDescGPU* DDGIVolumeDescGPU = GraphBuilder.AllocParameters<FDDGIVolumeDescGPU>();
-		*DDGIVolumeDescGPU = DefaultDDGIVolumeDescGPU;
-		DDGIVolumeDescGPU->probeGridSpacing = probeGridSpacing;
-		DDGIVolumeDescGPU->probeGridCounts = VolProxy->ComponentData.ProbeCounts;
-		DDGIVolumeDescGPU->numRaysPerProbe = GetNumRaysPerProbe(VolProxy->ComponentData.RaysPerProbe);
-		DDGIVolumeDescGPU->probeBackfaceThreshold = VolProxy->ComponentData.ProbeBackfaceThreshold;
-		DDGIVolumeDescGPU->probeScrollOffsets = VolProxy->ComponentData.ProbeScrollOffsets;
-
-		FDDGIProbesClassify::FParameters DefaultPassParameters;
 		FDDGIProbesClassify::FParameters* PassParameters = GraphBuilder.AllocParameters<FDDGIProbesClassify::FParameters>();
-		*PassParameters = DefaultPassParameters;
+		*PassParameters = FDDGIProbesClassify::FParameters();
 
 		PassParameters->ProbeIndexStart = VolProxy->ProbeIndexStart;
 		PassParameters->ProbeIndexCount = VolProxy->ProbeIndexCount;
+		PassParameters->ClassificationLegacy = CVarDDGIClassificationLegacy.GetValueOnRenderThread() != 0 ? 1 : 0;
+		PassParameters->ClassificationMeasureOnly = bMeasureOnly ? 1 : 0;
 
-		PassParameters->DDGIVolume = GraphBuilder.CreateUniformBuffer(DDGIVolumeDescGPU);
+		PassParameters->DDGIVolume = DDGIVolumeUB;
 
 		PassParameters->DDGIVolumeRayDataUAV = ProbesRadianceUAV;
 		// This resource is required if this method was called.
 		check(VolProxy->ProbesStates);
 		PassParameters->DDGIVolumeProbeStatesUAV = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(VolProxy->ProbesStates));
-
-		// Dispatch the compute shader
-		float groupSizeX = 8.f;
-		float groupSizeY = 4.f;
+		PassParameters->DDGIVolumeProbeVariabilityUAV = CreateProbeVariabilityUAV(GraphBuilder, VolProxy);
 
 		FIntPoint ProbeCount2D = Get2DProbeCount(VolProxy->ComponentData.ProbeCounts);
-		uint32 numThreadsX = ProbeCount2D.X;
-		uint32 numThreadsY = ProbeCount2D.Y;
-		uint32 numGroupsX = (uint32)ceil((float)numThreadsX / groupSizeX);
-		uint32 numGroupsY = (uint32)ceil((float)numThreadsY / groupSizeY);
-
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
-			RDG_EVENT_NAME("DDGI Probe Classification"),
+			RDG_EVENT_NAME("DDGI Probe Classification%s", bMeasureOnly ? TEXT(" (Variability Check)") : TEXT("")),
 			ComputeShader,
 			PassParameters,
-			FIntVector(numGroupsX, numGroupsY, 1)
+			FComputeShaderUtils::GetGroupCount(ProbeCount2D, FIntPoint(8, 4))
 		);
 	}
 
@@ -1848,46 +1629,9 @@ namespace DDGIVolumeUpdate
 
 #if !IS_MONOLITHIC
 
-bool FViewInfo::HasRayTracingScene() const
-{
-	check(Family);
-	FScene* Scene = Family->Scene ? Family->Scene->GetRenderScene() : nullptr;
-	if (Scene)
-	{
-		return Scene->RayTracingScene.IsCreated();
-	}
-	return false;
-}
-
-FRHIRayTracingScene* FViewInfo::GetRayTracingSceneChecked(ERayTracingSceneLayer Layer) const
-{
-	check(Family);
-	if (Family->Scene)
-	{
-		if (FScene* Scene = Family->Scene->GetRenderScene())
-		{
-			FRHIRayTracingScene* Result = Scene->RayTracingScene.GetRHIRayTracingScene(Layer);
-			checkf(Result, TEXT("Ray tracing scene is expected to be created at this point."));
-			return Result;
-		}
-	}
-	return nullptr;
-}
-
-FRDGBufferSRVRef FViewInfo::GetRayTracingSceneLayerViewChecked(ERayTracingSceneLayer Layer) const
-{
-	FRDGBufferSRVRef Result = nullptr;
-	check(Family);
-	if (Family->Scene)
-	{
-		if (FScene* Scene = Family->Scene->GetRenderScene())
-		{
-			Result = Scene->RayTracingScene.GetLayerView(Layer);
-		}
-	}
-	checkf(Result, TEXT("Ray tracing scene SRV is expected to be created at this point."));
-	return Result;
-}
+// The 5.8 Renderer exports FViewInfo::HasRayTracingScene, GetRayTracingSceneChecked and GetRayTracingSceneLayerViewChecked
+// in the RENDERER_API, so this module no longer defines its own copies. 
+//GetRayTracingInstanceHitCountUAV is still not exported and keeps its definition below.
 
 FRDGBufferUAVRef FViewInfo::GetRayTracingInstanceHitCountUAV(FRDGBuilder& GraphBuilder) const
 {
@@ -1896,8 +1640,7 @@ FRDGBufferUAVRef FViewInfo::GetRayTracingInstanceHitCountUAV(FRDGBuilder& GraphB
 	{
 		if (FScene* Scene = Family->Scene->GetRenderScene())
 		{
-			//return Scene->RayTracingScene.GetInstanceHitCountBufferUAV(ERayTracingSceneLayer::Base, GetRayTracingSceneViewHandle());
-			return Scene->RayTracingScene.GetInstanceHitCountBufferUAV(ERayTracingSceneLayer::Base);
+			return Scene->RayTracingScene.GetInstanceHitCountBufferUAV(ERayTracingSceneLayer::Base, GetRayTracingSceneViewHandle());
 		}
 	}
 	return nullptr;

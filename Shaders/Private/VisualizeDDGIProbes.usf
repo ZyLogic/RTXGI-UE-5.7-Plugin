@@ -35,6 +35,12 @@ uint ShouldUsePreExposure;
 int3 VolumeProbeScrollOffsets;
 float IrradianceScalar;
 
+int VolumeProbeRelocationEnabled;
+int VolumeProbeIrradianceFormat;
+Texture2D<float4> ProbeVariability;     // interior irradiance texels: R = coefficient of variation, G = weight
+int VolumeProbeVariabilityEnabled;
+float VariabilityThreshold;
+
 struct FVisualizeDDGIProbesVSToPS
 {
     nointerpolation float3 ProbeOrigin : TEXCOORD0;
@@ -49,15 +55,16 @@ void VisualizeDDGIProbesVS(
     out float4 OutPosition : SV_POSITION
 )
 {
-#if RTXGI_DDGI_PROBE_RELOCATION
-    #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-        float3 Translation = DDGIGetProbeWorldPositionWithOffset(InstanceId, VolumePosition, VolumeRotation, VolumeProbeGridCounts, VolumeProbeGridSpacing, VolumeProbeScrollOffsets, ProbeOffsets);
-    #else
-        float3 Translation = DDGIGetProbeWorldPositionWithOffset(InstanceId, VolumePosition, VolumeRotation, VolumeProbeGridCounts, VolumeProbeGridSpacing, ProbeOffsets);
-    #endif
-#else
-    float3 Translation = DDGIGetProbeWorldPosition(InstanceId, VolumePosition, VolumeRotation, VolumeProbeGridCounts, VolumeProbeGridSpacing);
-#endif
+    int ProbeIndex = int(InstanceId);
+    float3 Translation;
+    if (VolumeProbeRelocationEnabled != 0)
+    {
+        Translation = DDGIGetProbeWorldPositionWithOffset(ProbeIndex, VolumePosition, VolumeRotation, VolumeProbeGridCounts, VolumeProbeGridSpacing, VolumeProbeScrollOffsets, ProbeOffsets);
+    }
+    else
+    {
+        Translation = DDGIGetProbeWorldPosition(ProbeIndex, VolumePosition, VolumeRotation, VolumeProbeGridCounts, VolumeProbeGridSpacing);
+    }
 
     float4x4 Transform = {	ProbeRadius, 0.f, 0.f, 0.f,
                             0.f, ProbeRadius, 0.f, 0.f,
@@ -83,13 +90,9 @@ void VisualizeDDGIProbesPS(
 
     float3 Output = float3(0.0f, 0.0f, 0.0f);
 
-    #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
         float2 ProbeUVDistance = DDGIGetProbeUV(Input.InstanceId, OctantCoordinates, VolumeProbeGridCounts, VolumeProbeNumDistanceTexels, VolumeProbeScrollOffsets);
         float2 ProbeUVIrradiance = DDGIGetProbeUV(Input.InstanceId, OctantCoordinates, VolumeProbeGridCounts, VolumeProbeNumIrradianceTexels, VolumeProbeScrollOffsets);
-    #else
-        float2 ProbeUVDistance = DDGIGetProbeUV(Input.InstanceId, OctantCoordinates, VolumeProbeGridCounts, VolumeProbeNumDistanceTexels);
-        float2 ProbeUVIrradiance = DDGIGetProbeUV(Input.InstanceId, OctantCoordinates, VolumeProbeGridCounts, VolumeProbeNumIrradianceTexels);
-    #endif
+    int StorageProbeIndex = DDGIGetProbeIndexOffset(int(Input.InstanceId), VolumeProbeGridCounts, VolumeProbeScrollOffsets);
 
     if (Mode == 1)
     {
@@ -103,21 +106,48 @@ void VisualizeDDGIProbesPS(
         // Multiply by the area of the integration domain (2PI) to complete the irradiance estimate. Divide by PI to normalize for the display.
         Output *= 2.f;
 
-        #if !RTXGI_DDGI_FORMAT_IRRADIANCE
+        if (VolumeProbeIrradianceFormat == 0)
+        {
             Output *= 1.0989f;    // Adjust for energy loss due to reduced precision in the R10G10B10A2 irradiance texture format
-        #endif
+        }
 
         Output /= IrradianceScalar;
     }
     else if (Mode == 2)
     {
-        float Distance = ProbeDistanceTexture.SampleLevel(ProbeSampler, ProbeUVDistance, 0).r;
+        float Distance = 2.f * ProbeDistanceTexture.SampleLevel(ProbeSampler, ProbeUVDistance, 0).r;
         Output = float3(Distance / DepthScale, Distance / DepthScale, Distance / DepthScale);
     }
     else if (Mode == 3)
     {
-        float Distance = ProbeDistanceTexture.SampleLevel(ProbeSampler, ProbeUVDistance, 0).g;
+        float Distance = 2.f * ProbeDistanceTexture.SampleLevel(ProbeSampler, ProbeUVDistance, 0).g;
         Output = float3(Distance / DepthScale, Distance / DepthScale, Distance / DepthScale);
+    }
+    else if (Mode == 4)
+    {
+        if (VolumeProbeVariabilityEnabled == 0)
+        {
+            Output = float3(0.f, 0.f, 0.25f);
+        }
+        else
+        {
+            int NumTexels = VolumeProbeNumIrradianceTexels;
+            int2 TexelInProbe = clamp(int2(floor((OctantCoordinates * 0.5f + 0.5f) * NumTexels)), int2(0, 0), int2(NumTexels - 1, NumTexels - 1));
+            int2 VariabilityCoords = int2(DDGIGetThreadBaseCoords(StorageProbeIndex, VolumeProbeGridCounts, NumTexels)) + TexelInProbe;
+            float4 Variability = ProbeVariability.Load(int3(VariabilityCoords, 0));
+            if (Variability.g <= 0.f)
+            {
+                Output = float3(0.f, 0.f, 1.f);
+            }
+            else
+            {
+                float Ratio = saturate(Variability.r / max(VariabilityThreshold, 1e-6f));
+                Output = lerp(float3(0.f, 1.f, 0.f), float3(1.f, 0.f, 0.f), Ratio);
+            }
+        }
+        // Don't early expose the debug colors
+        OutColor = float4(Output, 1.f);
+        return;
     }
     else
     {
@@ -126,24 +156,17 @@ void VisualizeDDGIProbesPS(
 
     Output *= ShouldUsePreExposure ? PreExposure : 1.0f;
 
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
     {
-        #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-            int probeIndex = DDGIGetProbeIndexOffset(Input.InstanceId, VolumeProbeGridCounts, VolumeProbeScrollOffsets);
-        #else
-            int probeIndex = Input.InstanceId;
-        #endif
 
-        int2 texelPosition = DDGIGetProbeTexelPosition(probeIndex, VolumeProbeGridCounts);
+        int2 texelPosition = DDGIGetProbeTexelPosition(StorageProbeIndex, VolumeProbeGridCounts);
         int  probeState = ProbeStates[texelPosition];
         if (probeState == PROBE_STATE_INACTIVE)
         {
-            float3 SurfaceToCamera = normalize(CameraPosition - Input.WorldPosition);
+            float3 SurfaceToCamera = normalize(CameraPosition - Input.WorldPosition.xyz);
             if (dot(SurfaceToCamera, Direction) < 0.5f)
                 Output = float3(1.0f, 0.0f, 0.0f);
         }
     }
-#endif
 
     OutColor = float4(Output, 1.f);
 }

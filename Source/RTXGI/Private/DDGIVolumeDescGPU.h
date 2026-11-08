@@ -40,8 +40,15 @@ BEGIN_UNIFORM_BUFFER_STRUCT(FDDGIVolumeDescGPU, )
 	SHADER_PARAMETER(int,           volumeMovementType)
 	SHADER_PARAMETER(FIntVector,    probeScrollOffsets)
 
-	SHADER_PARAMETER(float,         probeBackfaceThreshold)
+	// Must list the same members as the HLSL struct in Shaders/Private/SDK/DDGIVolumeDescGPU.ush.
+	SHADER_PARAMETER(float,         probeRandomRayBackfaceThreshold)
+	SHADER_PARAMETER(float,         probeFixedRayBackfaceThreshold)
 	SHADER_PARAMETER(float,         probeMinFrontfaceDistance)
+
+	SHADER_PARAMETER(int,           probeRelocationEnabled)     // 1: probe offsets texture is valid and used
+	SHADER_PARAMETER(int,           probeRayDataFormat)         // 0: F32x2 (radiance packed R10G10B10), 1: F32x4
+	SHADER_PARAMETER(int,           probeIrradianceFormat)      // 0: R10G10B10A2 UNORM, 1: float (16 or 32 bit)
+	SHADER_PARAMETER(int,           probeVariabilityEnabled)    // 1: the irradiance blend writes the coefficient of variation
 END_UNIFORM_BUFFER_STRUCT()
 
 #endif /* RTXGI_DDGI_VOLUME_DESC_GPU_H */

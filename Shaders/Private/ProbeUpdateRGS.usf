@@ -43,136 +43,201 @@
 #include "/Engine/Private/HeightFogCommon.ush"
 #include "/Engine/Private/SobolRandom.ush"
 
+#if RAY_TRACING_USE_SER
+#include "/Engine/Public/NvidiaExtensionsCommon.ush"
+#endif
+
 // START RGS PARAMS
 RaytracingAccelerationStructure TLAS;
 
 RWTexture2D<float4> RadianceOutput;
 RWTexture2D<float4> DebugOutput;
 
-#if RTXGI_DDGI_PARTIAL_UPDATE_ISV
 RWTexture2D<uint>   DDGIProbeScrollSpace;
-#endif
 
-uint   FrameRandomSeed;
+uint FrameRandomSeed;
 
-Texture2D<float4>   DDGIVolume_ProbeIrradiance;
-Texture2D<float4>   DDGIVolume_ProbeDistance;
-Texture2D<float4>   DDGIVolume_ProbeOffsets;
-Texture2D<uint>     DDGIVolume_ProbeStates;
-SamplerState        DDGIVolume_LinearClampSampler;
-float3              DDGIVolume_Radius;
-float               DDGIVolume_IrradianceScalar;
-float               DDGIVolume_EmissiveMultiplier;
-int                 DDGIVolume_ProbeIndexStart;
-int                 DDGIVolume_ProbeIndexCount;
+Texture2D<float4> DDGIVolume_ProbeIrradiance;
+Texture2D<float4> DDGIVolume_ProbeDistance;
+Texture2D<float4> DDGIVolume_ProbeOffsets;
+Texture2D<uint> DDGIVolume_ProbeStates;
+SamplerState DDGIVolume_LinearClampSampler;
+float3 DDGIVolume_Radius;
+float DDGIVolume_IrradianceScalar;
+float DDGIVolume_EmissiveMultiplier;
+int DDGIVolume_ProbeIndexStart;
+int DDGIVolume_ProbeIndexCount;
+int DDGIVolume_PartialUpdateISV;        // 1: forced scrolling update, only probes that wrapped are traced
+int DDGIVolume_SkyLightType;            // EDDGISkyLightType: 0 None, 1 Raster, 2 Ray Tracing
+uint DDGIVolume_SERCoherenceHintBits;   // 0: sort by hit object only; 1: add a "fixed ray" coherence bit
 
-float3              Sky_Color;
+float3 Sky_Color;
 TextureCube<float4> Sky_Texture;
-SamplerState        Sky_TextureSampler;
+SamplerState Sky_TextureSampler;
 
 // END RGS PARAMS
 
 float3 GetEnvironmentalRadiance(in float3 direction)
 {
-#if RTXGI_DDGI_SKY_LIGHT_TYPE == 0 // None
-    return 0.f;
-#elif RTXGI_DDGI_SKY_LIGHT_TYPE == 1 // Raster
-    return Sky_Color * GetSkySHDiffuse(direction);
-#else // RTXGI_DDGI_SKY_LIGHT_TYPE == 2 // Ray Tracing
+    if (DDGIVolume_SkyLightType == 0) // None
+    {
+        return 0.f;
+    }
+    if (DDGIVolume_SkyLightType == 1) // Raster
+    {
+        return GetSkySHDiffuse(direction) * View.SkyLightColor.rgb;
+    }
+    // Ray Tracing
     return Sky_Color * TextureCubeSampleLevel(Sky_Texture, Sky_TextureSampler, direction, 0).rgb;
-#endif
 }
 
 void WriteRadianceOutput(uint2 DispatchIndex, float4 value)
 {
-#if !RTXGI_DDGI_FORMAT_RADIANCE
-    static const float c_threshold = 1.f / 255.f;
-    if (RTXGIMaxComponent(value.rgb) <= c_threshold) value.rgb = float3(0.f, 0.f, 0.f);
-#endif
+    const bool bFloatRayData = (DDGIVolume.probeRayDataFormat != 0);
+
+    if (!bFloatRayData)
+    {
+        static const float c_threshold = 1.f / 255.f;
+        if (RTXGIMaxComponent(value.rgb) <= c_threshold)
+            value.rgb = float3(0.f, 0.f, 0.f);
+    }
 
     // Radiance / irradiance is multipled by this when stored, but divided by this when recalled.
     // This feature is to avoid clipping when using the 10 bit texture format.
     value.rgb *= DDGIVolume_IrradianceScalar;
 
-#if RTXGI_DDGI_FORMAT_RADIANCE
-    // Use R32G32B32A32_FLOAT format. Store color components and hit distance as 32-bit float values.
-    RadianceOutput[DispatchIndex.xy] = value;
-#else
-    // Use R32G32_FLOAT format (don't use R32G32_UINT since hit distance needs to be negative sometimes).
-    // Pack color as R10G10B10 in R32 and store hit distance in G32.
-    RadianceOutput[DispatchIndex.xy] = float4(asfloat(RTXGIFloat3ToUint(clamp(value.rgb, 0.0f, 1.0f))), value.w, 0.f, 0.f);
-#endif
+    if (bFloatRayData)
+    {
+        // Use R32G32B32A32_FLOAT format. Store color components and hit distance as 32-bit float values.
+        RadianceOutput[DispatchIndex.xy] = value;
+    }
+    else
+    {
+        // Use R32G32_FLOAT format (don't use R32G32_UINT since hit distance needs to be negative sometimes).
+        // Pack color as R10G10B10 in R32 and store hit distance in G32.
+        RadianceOutput[DispatchIndex.xy] = float4(asfloat(RTXGIFloat3ToUint(clamp(value.rgb, 0.0f, 1.0f))), value.w, 0.f, 0.f);
+    }
 
 #if DDGIVolumeUpdateDebug != 0
     DebugOutput[DispatchIndex.xy] = value;
 #endif
 }
 
+// Copy of TraceMaterialRayPacked (RayTracingCommon.ush) with the TraceRay call optionally wrapped in SER.
+void DDGITraceMaterialRayPacked(
+    inout FPackedMaterialClosestHitPayload Payload,
+    in RaytracingAccelerationStructure InTLAS,
+    in uint RayFlags,
+    in uint InstanceInclusionMask,
+    in FRayDesc Ray,
+    inout FRayCone RayCone,
+    in bool bEnableSkyLightContribution,
+    in bool bIsCameraRay,
+    in uint CoherenceHint)
+{
+    const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_MATERIAL;
+    const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
+    const uint MissShaderIndex = 0;
+
+    // Set payload inputs
+    Payload.SetRayCone(RayCone);
+
+    if (bEnableSkyLightContribution)
+    {
+        // Enable Sky Light contribution in the payload if requested
+        Payload.SetEnableSkyLightContribution();
+    }
+
+    if (bIsCameraRay)
+    {
+        Payload.SetCameraRay();
+    }
+
+    // Trace the ray
+    Payload.HitT = 0;
+    RayDesc NativeRay = Ray.GetNativeDesc();
+
+#if RAY_TRACING_USE_SER
+    NvHitObject Hit;
+    NvTraceRayHitObject(InTLAS, RayFlags, InstanceInclusionMask, RayContributionToHitGroupIndex, MultiplierForGeometryContributionToShaderIndex, MissShaderIndex, NativeRay, Payload, Hit);
+    NvReorderThread(Hit, CoherenceHint, DDGIVolume_SERCoherenceHintBits);
+    NvInvokeHitObject(InTLAS, Hit, Payload);
+#else
+    TraceRay(
+        InTLAS,
+        RayFlags,
+        InstanceInclusionMask,
+        RayContributionToHitGroupIndex,
+        MultiplierForGeometryContributionToShaderIndex,
+        MissShaderIndex,
+        NativeRay,
+        Payload);
+#endif
+
+    RayCone = Payload.GetRayCone();
+}
+
 RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
 {
     // Adapted from ProbeTraceRGS.hlsl in the test harness aiming for minimal changes to help future merges.
 
-    float4 result = 0.f;
-
     uint2 DispatchIndex = DispatchRaysIndex().xy;
-    int rayIndex = DispatchIndex.x;                    // index of ray within a probe
-    int probeIndex = DispatchIndex.y;                  // index of current probe
+    int rayIndex = DispatchIndex.x; // index of ray within a probe
+    int probeIndex = DispatchIndex.y; // index of current probe
 
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-    int storageProbeIndex = DDGIGetProbeIndexOffset(probeIndex, DDGIVolume.probeGridCounts, DDGIVolume.probeScrollOffsets);
-#else
-    int storageProbeIndex = probeIndex;
-#endif
-    int2 texelPosition = DDGIGetProbeTexelPosition(storageProbeIndex, DDGIVolume.probeGridCounts);
+    const int3 probeGridCounts = DDGIVolume.probeGridCounts;
 
-#if RTXGI_DDGI_PARTIAL_UPDATE_ISV
-    uint3 prevProbeSpace;
-    prevProbeSpace.x = DDGIProbeScrollSpace[texelPosition].x & 0x01;
-    prevProbeSpace.y = (DDGIProbeScrollSpace[texelPosition].x & 0x02) >> 1;
-    prevProbeSpace.z = (DDGIProbeScrollSpace[texelPosition].x & 0x04) >> 2;
+    // Scroll offsets are zero for non-scrolling volumes (identity remap)
+    int storageProbeIndex = DDGIGetProbeIndexOffset(probeIndex, probeGridCounts, DDGIVolume.probeScrollOffsets);
+    int2 texelPosition = DDGIGetProbeTexelPosition(storageProbeIndex, probeGridCounts);
 
-    uint3 probeSpace = uint3(0, 0, 0);
-
-    int3 probeGridCoord = DDGIGetProbeCoords(probeIndex, DDGIVolume.probeGridCounts);
-    probeSpace = (probeGridCoord + DDGIVolume.probeScrollOffsets) / (DDGIVolume.probeGridCounts);
-    probeSpace = probeSpace % 2;
-    if(prevProbeSpace.x == probeSpace.x && prevProbeSpace.y == probeSpace.y && prevProbeSpace.z == probeSpace.z)
-        return;
-#else
-    // Handle round robin updating.
-    // If this probe is outside of the window for updating, bail out.
+    if (DDGIVolume_PartialUpdateISV != 0)
     {
-        int numProbes = DDGIVolume.probeGridCounts.x * DDGIVolume.probeGridCounts.y * DDGIVolume.probeGridCounts.z;
+        uint packedPrevProbeSpace = DDGIProbeScrollSpace[texelPosition].x;
+        uint3 prevProbeSpace = uint3(packedPrevProbeSpace & 0x01, (packedPrevProbeSpace & 0x02) >> 1, (packedPrevProbeSpace & 0x04) >> 2);
+
+        int3 probeGridCoord = DDGIGetProbeCoords(probeIndex, probeGridCounts);
+        uint3 probeSpace = uint3((probeGridCoord + DDGIVolume.probeScrollOffsets) / probeGridCounts) % 2;
+        if (all(prevProbeSpace == probeSpace))
+            return;
+    }
+    else
+    {
+        // Handle round robin updating.
+        // If this probe is outside of the window for updating, bail out.
+        int numProbes = probeGridCounts.x * probeGridCounts.y * probeGridCounts.z;
         int probeRRIndex = (probeIndex < DDGIVolume_ProbeIndexStart) ? probeIndex + numProbes : probeIndex;
         if (probeRRIndex >= DDGIVolume_ProbeIndexStart + DDGIVolume_ProbeIndexCount)
             return;
     }
-#endif
 
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
-    int  probeState = DDGIVolume_ProbeStates.Load(int3(texelPosition, 0));
-    if (probeState == PROBE_STATE_INACTIVE && rayIndex >= RTXGI_DDGI_NUM_FIXED_RAYS)
+    // Classification is always on: fixed rays are the first RTXGI_DDGI_NUM_FIXED_RAYS
+    const bool bFixedRay = (rayIndex < RTXGI_DDGI_NUM_FIXED_RAYS);
+
+    int probeState = DDGIVolume_ProbeStates.Load(int3(texelPosition, 0));
+    if (probeState == PROBE_STATE_INACTIVE && !bFixedRay)
     {
-       // if the probe is inactive, do not shoot rays, unless it is one of the fixed rays that could potentially reactivate the probe
-       return;
+        // if the probe is inactive, do not shoot rays, unless it is one of the fixed rays that could potentially reactivate the probe
+        return;
     }
-#endif
 
-#if RTXGI_DDGI_PROBE_RELOCATION
-    #if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
-    float3 probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume.origin, DDGIVolume.rotation, DDGIVolume.probeGridCounts, DDGIVolume.probeGridSpacing, DDGIVolume.probeScrollOffsets, DDGIVolume_ProbeOffsets);
-    #else
-    float3 probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume.origin, DDGIVolume.rotation, DDGIVolume.probeGridCounts, DDGIVolume.probeGridSpacing, DDGIVolume_ProbeOffsets);
-    #endif
-#else
-    float3 probeWorldPosition = DDGIGetProbeWorldPosition(probeIndex, DDGIVolume.origin, DDGIVolume.rotation, DDGIVolume.probeGridCounts, DDGIVolume.probeGridSpacing);
-#endif
+    float3 probeWorldPosition;
+    if (DDGIVolume.probeRelocationEnabled != 0)
+    {
+        probeWorldPosition = DDGIGetProbeWorldPositionWithOffset(probeIndex, DDGIVolume.origin, DDGIVolume.rotation, probeGridCounts, DDGIVolume.probeGridSpacing, DDGIVolume.probeScrollOffsets, DDGIVolume_ProbeOffsets);
+    }
+    else
+    {
+        probeWorldPosition = DDGIGetProbeWorldPosition(probeIndex, DDGIVolume.origin, DDGIVolume.rotation, probeGridCounts, DDGIVolume.probeGridSpacing);
+    }
+
+    float3 probeTranslatedWorldPosition = DFFastToTranslatedWorld(probeWorldPosition, PrimaryView.PreViewTranslation);
 
     float3 probeRayDirection = DDGIGetProbeRayDirection(rayIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform);
 
     // Setup the probe ray
     FRayDesc Ray;
-    Ray.Origin = probeWorldPosition;
+    Ray.Origin = probeTranslatedWorldPosition;
     Ray.Direction = probeRayDirection;
     Ray.TMin = 0.f;
     Ray.TMax = DDGIVolume.probeMaxRayDistance;
@@ -186,76 +251,99 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
     const bool bShouldDoEmissiveAndIndirectLighting = true;
     const bool bRayTraceSkyLightContribution = false;
     const bool bDecoupleSampleGeneration = true;
-    const bool bEnableSkyLightContribution = false;
+    bool bEnableSkyLightContribution = false;
 
     float3 PathVertexRadiance = float3(0, 0, 0);
-    FRayCone RayCone = (FRayCone)0;
+    FRayCone RayCone = (FRayCone) 0;
     float MaxNormalBias = 0.01f;
 
     // Trace
     uint linear_rand = DispatchIndex.x + DispatchIndex.y * 9973;
     RandomSequence RandSequence;
     RandomSequence_Initialize(RandSequence, linear_rand, FrameRandomSeed);
-    uint2 PixelCoord = DispatchRaysIndex().xy; // Hmmmm.... does TraceRayAndAccumulateResults() assume screen-space trace or is this just for stochastics?  hopefully the latter but fixme:checkme
+    uint2 PixelCoord = DispatchRaysIndex().xy; // Only used for stochastics / ray traced sky light, not screen space
 
+    // Use TLAS for both acceleration structures since FarFieldTLAS is not available in this context
+    RaytracingAccelerationStructure FarFieldTLAS = TLAS;
+    float MaxTraceDistance = Ray.TMax;
+    const bool bIsCameraRay = false;
 
-	// Use TLAS for both acceleration structures since FarFieldTLAS is not available in this context
-	RaytracingAccelerationStructure FarFieldTLAS = TLAS;
-	float MaxTraceDistance = Ray.TMax;
-	const bool bIsCameraRay = false;
+    // --- TraceRayAndAccumulateResults, split (RayTracingLightingCommon.ush) ---
+    if (bRayTraceSkyLightContribution)
+    {
+        // Disable precomputed sky light contribution from hit shaders when ray tracing sky light contribution
+        bEnableSkyLightContribution = false;
+    }
 
-	FMaterialClosestHitPayload Payload = TraceRayAndAccumulateResults(
-		Ray,
-		TLAS,
-		FarFieldTLAS,
-		RayFlags,
-		InstanceInclusionMask,
-		RandSequence,
-		PixelCoord,
-		MaxNormalBias,
-		MaxTraceDistance,
-		ReflectedShadowsType,
-		ReflectedShadowsType,
-		bShouldDoDirectLighting,
-		bShouldDoEmissiveAndIndirectLighting,
-		bRayTraceSkyLightContribution,
-		bDecoupleSampleGeneration,
-		bIsCameraRay,
-		RayCone,
-		bEnableSkyLightContribution,
-		PathVertexRadiance);
+    FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+    DDGITraceMaterialRayPacked(
+        PackedPayload,
+        TLAS,
+        RayFlags,
+        InstanceInclusionMask,
+        Ray,
+        RayCone,
+        bEnableSkyLightContribution,
+        bIsCameraRay,
+        bFixedRay ? 1u : 0u);
 
-    // Adjust emissive contribution if we should
-    PathVertexRadiance += Payload.Radiance * (DDGIVolume_EmissiveMultiplier - 1.0f);
+    if (!bFixedRay)
+    {
+        float3 TranslatedWorldPosition = Ray.Origin + Ray.Direction * PackedPayload.HitT;
+        float3 ViewDirection = Ray.Direction;
 
-    result = float4(PathVertexRadiance.xyz, Payload.HitT);
+        AccumulateResults(
+            PackedPayload,
+            TranslatedWorldPosition,
+            ViewDirection,
+            TLAS,
+            FarFieldTLAS,
+            RandSequence,
+            PixelCoord,
+            MaxNormalBias,
+            MaxTraceDistance,
+            ReflectedShadowsType,
+            ReflectedShadowsType,
+            bShouldDoDirectLighting,
+            bShouldDoEmissiveAndIndirectLighting,
+            bRayTraceSkyLightContribution,
+            bDecoupleSampleGeneration,
+            RayCone,
+            PathVertexRadiance);
+    }
+
+    FMaterialClosestHitPayload Payload = UnpackRayTracingPayload(PackedPayload, Ray);
+    // --- end of the split ---
+
+    if (!bFixedRay)
+    {
+        // Adjust emissive contribution if we should
+        PathVertexRadiance += Payload.Radiance * (DDGIVolume_EmissiveMultiplier - 1.0f);
+    }
 
     // Ray miss. Set hit distance to a large value and exit early.
     if (Payload.IsMiss())
     {
-        result.rgb += GetEnvironmentalRadiance(Ray.Direction);
-        result.w = 1e27f;
-        WriteRadianceOutput(DispatchIndex.xy, result);
+        float3 missRadiance = bFixedRay ? float3(0.f, 0.f, 0.f) : (PathVertexRadiance.xyz + GetEnvironmentalRadiance(Ray.Direction));
+        WriteRadianceOutput(DispatchIndex.xy, float4(missRadiance, 1e27f));
         return;
     }
 
     // Hit a surface backface. Set the radiance to black and exit early.
-    if (!Payload.IsFrontFace() && Payload.ShadingModelID != SHADINGMODELID_TWOSIDED_FOLIAGE)
+    if (!Payload.IsFrontFace() && !Payload.IsTwoSided())
     {
-        // Shorten the hit distance on a backface hit by 80%
+        // Shorten the hit distance on a backface hit
         // Make distance negative to encode backface for the probe position preprocess.
         WriteRadianceOutput(DispatchIndex.xy, float4(0.0f, 0.0f, 0.0f, -Payload.HitT * 0.2f));
         return;
     }
 
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
-    // hit a frontface, but probe is inactive, so this ray will only be used for reclassification, don't need any lighting
-    if (probeState == PROBE_STATE_INACTIVE)
+    // Front face hit on a ray that only feeds relocation/classification.
+    if (bFixedRay || probeState == PROBE_STATE_INACTIVE)
     {
         WriteRadianceOutput(DispatchIndex.xy, float4(0.0f, 0.0f, 0.0f, Payload.HitT));
         return;
     }
-#endif
 
     float3 probeLighting = float3(0.0f, 0.0f, 0.0f);
     {
@@ -267,15 +355,11 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
             resources.probeIrradianceSRV = DDGIVolume_ProbeIrradiance;
             resources.probeDistanceSRV = DDGIVolume_ProbeDistance;
             resources.bilinearSampler = DDGIVolume_LinearClampSampler;
-#if RTXGI_DDGI_PROBE_RELOCATION
             resources.probeOffsetsSRV = DDGIVolume_ProbeOffsets;
-#endif
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
             resources.probeStatesSRV = DDGIVolume_ProbeStates;
-#endif
         }
 
-        DDGIVolumeDescGPU DDGIVolume_0;
+        DDGIVolumeDescGPU DDGIVolume_0 = (DDGIVolumeDescGPU)0;
         DDGIVolume_0.origin = DDGIVolume.origin;
         DDGIVolume_0.rotation = DDGIVolume.rotation;
         DDGIVolume_0.probeMaxRayDistance = DDGIVolume.probeMaxRayDistance;
@@ -288,10 +372,14 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
         DDGIVolume_0.probeIrradianceEncodingGamma = DDGIVolume.probeIrradianceEncodingGamma;
         DDGIVolume_0.normalBias = DDGIVolume.normalBias;
         DDGIVolume_0.viewBias = DDGIVolume.viewBias;
+        DDGIVolume_0.volumeMovementType = DDGIVolume.volumeMovementType;
         DDGIVolume_0.probeScrollOffsets = DDGIVolume.probeScrollOffsets;
+        DDGIVolume_0.probeRelocationEnabled = DDGIVolume.probeRelocationEnabled;
+        DDGIVolume_0.probeIrradianceFormat = DDGIVolume.probeIrradianceFormat;
 
         // Get irradiance from the DDGIVolume
-        float3 surfacePosWS = Ray.Origin + Ray.Direction * Payload.HitT;
+        float3 surfacePosTranslated = Ray.Origin + Ray.Direction * Payload.HitT;
+        float3 surfacePosWS = DFFastSubtractDemote(surfacePosTranslated, PrimaryView.PreViewTranslation);
         float3 surfaceBias = DDGIGetSurfaceBias(Payload.WorldNormal, Ray.Direction, DDGIVolume_0);
         float3 irradiance = DDGIGetVolumeIrradiance(
             surfacePosWS,
@@ -301,14 +389,13 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeUpdateRGS)
             resources
         );
 
-        // Perfectly diffuse reflectors don't exist in the real world. Limit the BRDF
-        // albedo to a maximum value to account for the energy loss at each bounce.
+        //Limit the BRDF's max albedo to take into account energy loss per bounce
         float maxAlbedo = 0.9f;
 
         probeLighting = irradiance * (min(albedo, maxAlbedo) / RTXGI_PI);
         probeLighting /= DDGIVolume_IrradianceScalar;
 
-        // don't apply volume lighting outside the volume
+        // outside of the volume's bounds, so don't apply lighting
         float3 relPos = abs(surfacePosWS - DDGIVolume.origin);
         if ((relPos.x > DDGIVolume_Radius.x || relPos.y > DDGIVolume_Radius.y || relPos.z > DDGIVolume_Radius.z))
             probeLighting = float3(0.0f, 0.0f, 0.0f);

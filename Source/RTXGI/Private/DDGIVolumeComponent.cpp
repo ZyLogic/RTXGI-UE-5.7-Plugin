@@ -11,6 +11,7 @@
 #include "DDGIVolumeComponent.h"
 #include "DDGIVolume.h"
 #include "DDGIVolumeUpdate.h"
+#include "DDGIProbeVariability.h"
 
 #include "RTXGIPluginSettings.h"
 #include "LegacyEngineCompat.h"
@@ -23,6 +24,7 @@
 #include "ShaderParameterUtils.h"
 #include "SystemTextures.h"
 #include "Logging/LogMacros.h"
+#include "RenderTargetPool.h"
 // UE Private Interfaces
 #include "PostProcess/SceneRenderTargets.h"
 #include "SceneRendering.h"
@@ -89,8 +91,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVolumeData, )
 	SHADER_PARAMETER(float, ViewBias)
 	SHADER_PARAMETER(float, BlendDistance)
 	SHADER_PARAMETER(float, BlendDistanceBlack)
-	SHADER_PARAMETER(float, ApplyLighting)
 	SHADER_PARAMETER(float, IrradianceScalar)
+	SHADER_PARAMETER(int32, ProbeRelocationEnabled)
+	SHADER_PARAMETER(int32, ProbeIrradianceFormat)
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FApplyLightingDeferredShaderParameters, )
@@ -136,12 +139,8 @@ public:
 	using FParameters = FApplyLightingDeferredShaderParameters;
 
 	class FLightingChannelsDim : SHADER_PERMUTATION_BOOL("USE_LIGHTING_CHANNELS");
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
 
-	using FPermutationDomain = TShaderPermutationDomain<FLightingChannelsDim, FEnableRelocation, FEnableScrolling, FFormatRadiance, FFormatIrradiance>;
+	using FPermutationDomain = TShaderPermutationDomain<FLightingChannelsDim>;
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
@@ -165,7 +164,7 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return IsFeatureLevelSupported(Parameters.Platform, GMaxRHIFeatureLevel);
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 	}
 };
 
@@ -192,7 +191,7 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return IsFeatureLevelSupported(Parameters.Platform, GMaxRHIFeatureLevel);
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 	}
 };
 
@@ -284,7 +283,7 @@ void FDDGIVolumeSceneProxy::ReallocateSurfaces_RenderThread(FRHICommandListImmed
 	// Irradiance
 	{
 		FIntPoint ProxyTexDims = GetIrradianceTextureDimensions(ComponentData.ProbeCounts);
-		EPixelFormat Format = (IrradianceBits == EDDGIIrradianceBits::n32) ? FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatIrradianceHighBitDepth : FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatIrradianceLowBitDepth;
+		EPixelFormat Format = GetDDGIIrradiancePixelFormat(IrradianceBits);
 
 		FPooledRenderTargetDesc Desc(FPooledRenderTargetDesc::Create2DDesc(ProxyTexDims, Format, FClearValueBinding::Transparent, TexCreate_None, TexCreate_ShaderResource | TexCreate_UAV , false));
 #if ENGINE_MAJOR_VERSION < 5
@@ -341,7 +340,6 @@ void FDDGIVolumeSceneProxy::ReallocateSurfaces_RenderThread(FRHICommandListImmed
 		ProbesStates.SafeRelease();
 	}
 
-	if (ComponentData.EnableProbeScrolling)
 	{
 		EPixelFormat Format = FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatScrollSpace;
 
@@ -352,9 +350,19 @@ void FDDGIVolumeSceneProxy::ReallocateSurfaces_RenderThread(FRHICommandListImmed
 		GRenderTargetPool.FindFreeElement(RHICmdList, Desc, ProbesSpace, TEXT("DDGIScrollSpace"));
 #endif
 	}
+
+	// Interior irradiance texels of every probe (no borders): R = coefficient of variation, G = weight
+	if (ComponentData.EnableProbeVariability)
+	{
+		FIntPoint VariabilityDims = ProxyDims * FDDGIVolumeSceneProxy::FComponentData::c_NumTexelsIrradiance;
+		EPixelFormat Format = FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatVariability;
+
+		FPooledRenderTargetDesc Desc(FPooledRenderTargetDesc::Create2DDesc(VariabilityDims, Format, FClearValueBinding::Transparent, TexCreate_None, TexCreate_ShaderResource | TexCreate_UAV, false));
+		GRenderTargetPool.FindFreeElement(RHICmdList, Desc, ProbesVariability, TEXT("DDGIVariability"));
+	}
 	else
 	{
-		ProbesSpace.SafeRelease();
+		ProbesVariability.SafeRelease();
 	}
 }
 
@@ -374,7 +382,22 @@ void FDDGIVolumeSceneProxy::ResetTextures_RenderThread(FRDGBuilder& GraphBuilder
 		uint32 StatesClearColor[] = { 0u, 0u, 0u, 0u };
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(ProbesStates)), StatesClearColor);
 	}
+
+	if (ProbesSpace)
+	{
+		uint32 SpaceClearColor[] = { 0u, 0u, 0u, 0u };
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(ProbesSpace)), SpaceClearColor);
+	}
+
+	if (ProbesVariability)
+	{
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(ProbesVariability)), ClearColor);
+	}
+
+	bVariabilityResetRequested = true;
 }
+
+TMap<const void*, uint64> FDDGIVolumeSceneProxy::SceneLastUpdateFrameCounter;
 
 void FDDGIVolumeSceneProxy::HandlePreWorldFinishDestroy(UWorld* InWorld)
 {
@@ -383,6 +406,10 @@ void FDDGIVolumeSceneProxy::HandlePreWorldFinishDestroy(UWorld* InWorld)
 		[SceneKey](FRHICommandListImmediate& RHICmdList)
 		{
 			SceneRoundRobinValue.Remove(SceneKey);
+			SceneLastUpdateFrameCounter.Remove(SceneKey);
+#if RHI_RAYTRACING
+			DDGIProbeVariability::RemoveScene_RenderThread(SceneKey);
+#endif
 		}
 	);
 }
@@ -492,6 +519,7 @@ void DebugShaderPlatformsDetailed()
         (int32)CurrentSM6, 
         GGlobalShaderMap[CurrentSM6] ? TEXT("VALID") : TEXT("INVALID"));
 }
+
 void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 	const FScene& Scene,
 	const FViewInfo& View,
@@ -683,35 +711,14 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 			AddClearUAVPass(GraphBuilder, LightingPassUAV, FLinearColor::Transparent);
 		}
 
-		// Loop over the shader permutations to render indirect light from relevant volumes
-		for (int permutationIndex = 0; permutationIndex < 4; ++permutationIndex)
+		// One dispatch for all volumes. This used to loop over the four (relocation, scrolling) shader permutations and
+		// dispatch a full-screen pass for each combination present among the visible volumes, gating irradiance per
+		// volume with ApplyLighting. Relocation, scrolling and the irradiance format are now runtime values in FVolumeData.
 		{
-			// Render with the current shader permutation if there one (or more) volume that matches the permutation settings
-			bool enableRelocation = (permutationIndex & 1) != 0;
-			bool enableScrolling = (permutationIndex & 2) != 0;
-			bool foundAMatch = false;
-			for (int32 i = 0; i < volumes.Num(); ++i)
-			{
-				foundAMatch = true;
-				foundAMatch = foundAMatch && (enableRelocation == volumes[i].proxy->ComponentData.EnableProbeRelocation);
-				foundAMatch = foundAMatch && (enableScrolling == volumes[i].proxy->ComponentData.EnableProbeScrolling);
-				if (foundAMatch) break;
-			}
 
-			// Skip this shader permutation if there are no volumes that match its feature set
-			if (!foundAMatch) continue;
-			
-			
-			// Get the shader permutation
-			//FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
-
-			bool highBitCount = (GetDefault<URTXGIPluginSettings>()->IrradianceBits == EDDGIIrradianceBits::n32);
+			const bool bLowBitDepthIrradiance = IsDDGIIrradianceLowBitDepth(GetDefault<URTXGIPluginSettings>()->IrradianceBits);
 			FApplyLightingDeferredShaderCS::FPermutationDomain PermutationVector;
 			PermutationVector.Set<FApplyLightingDeferredShaderCS::FLightingChannelsDim>(Resources.LightingChannelsTexture != nullptr);
-			PermutationVector.Set<FApplyLightingDeferredShaderCS::FEnableRelocation>(enableRelocation);
-			PermutationVector.Set<FApplyLightingDeferredShaderCS::FEnableScrolling>(enableScrolling);
-			PermutationVector.Set<FApplyLightingDeferredShaderCS::FFormatRadiance>(highBitCount);
-			PermutationVector.Set<FApplyLightingDeferredShaderCS::FFormatIrradiance>(highBitCount);
 			TShaderMapRef<FApplyLightingDeferredShaderCS> ComputeShader(GlobalShaderMap, PermutationVector);
 
 			// Set the shader parameters
@@ -772,12 +779,8 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 				PassParameters->DDGIVolume[volumeIndex].BlendDistanceBlack = volumeProxy->ComponentData.BlendDistanceBlack;
 				PassParameters->DDGIVolume[volumeIndex].ProbeScrollOffsets = volumeProxy->ComponentData.ProbeScrollOffsets;
 
-				// Only apply lighting if this is the pass it should be applied in
-				// The shader needs data for all of the volumes for blending purposes
-				bool applyLighting = true;
-				applyLighting = applyLighting && (enableRelocation == volumeProxy->ComponentData.EnableProbeRelocation);
-				applyLighting = applyLighting && (enableScrolling == volumeProxy->ComponentData.EnableProbeScrolling);
-				PassParameters->DDGIVolume[volumeIndex].ApplyLighting = applyLighting;
+				PassParameters->DDGIVolume[volumeIndex].ProbeRelocationEnabled = (volumeProxy->ComponentData.EnableProbeRelocation && volumeProxy->ProbesOffsets.IsValid()) ? 1 : 0;
+				PassParameters->DDGIVolume[volumeIndex].ProbeIrradianceFormat = bLowBitDepthIrradiance ? 0 : 1;
 				PassParameters->DDGIVolume[volumeIndex].IrradianceScalar = volumeProxy->ComponentData.IrradianceScalar;
 
 				// Apply the lighting multiplier to artificially lighten or darken the indirect light from the volume
@@ -802,6 +805,12 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 					SET_DWORD_STAT(PROBE_COUNT_Z, probeCountZ);
 					DECLARE_DWORD_COUNTER_STAT(TEXT("Rays Per Probe (selected):"), RAYS_PER_PROBE, STATGROUP_RTXGI);
 					SET_DWORD_STAT(RAYS_PER_PROBE, raysPerProbe);
+					const FDDGIProbeVariabilityState& VariabilityState = volumeProxy->VariabilityState;
+					const bool bHasVariabilityReading = volumeProxy->ComponentData.EnableProbeVariability && VariabilityState.LastWeight > 0.0f;
+					DECLARE_FLOAT_COUNTER_STAT(TEXT("Probe Variability (selected):"), PROBE_VARIABILITY, STATGROUP_RTXGI);
+					SET_FLOAT_STAT(PROBE_VARIABILITY, bHasVariabilityReading ? VariabilityState.LastVariability : -1.0f);
+					DECLARE_DWORD_COUNTER_STAT(TEXT("Probe Variability Converged (selected):"), PROBE_VARIABILITY_CONVERGED, STATGROUP_RTXGI);
+					SET_DWORD_STAT(PROBE_VARIABILITY_CONVERGED, (volumeProxy->ComponentData.EnableProbeVariability && VariabilityState.bConverged) ? 1 : 0);
 				}
 #endif
 			}
@@ -922,6 +931,23 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectLight_RenderThread(
 	SET_FLOAT_STAT(FRAMETIME_TOTAL, totalGpuTime);
 	DECLARE_FLOAT_COUNTER_STAT(TEXT("Frametime Without RTXGI (ms):"), FRAMETIME_NO_RTXGI, STATGROUP_RTXGI);
 	SET_FLOAT_STAT(FRAMETIME_NO_RTXGI, timeWithoutRtxgi);
+
+	{
+		uint32 NumVariabilityVolumes = 0;
+		uint32 NumConvergedVolumes = 0;
+		for (const FDDGIVolumeSceneProxy* Proxy : AllProxiesReadyForRender_RenderThread)
+		{
+			if (Proxy->OwningScene == &Scene && Proxy->ComponentData.EnableVolume && Proxy->ComponentData.EnableProbeVariability)
+			{
+				++NumVariabilityVolumes;
+				NumConvergedVolumes += Proxy->VariabilityState.bConverged ? 1 : 0;
+			}
+		}
+		DECLARE_DWORD_COUNTER_STAT(TEXT("Probe Variability Volumes:"), PROBE_VARIABILITY_VOLUMES, STATGROUP_RTXGI);
+		SET_DWORD_STAT(PROBE_VARIABILITY_VOLUMES, NumVariabilityVolumes);
+		DECLARE_DWORD_COUNTER_STAT(TEXT("Converged Volumes (updates paused):"), PROBE_VARIABILITY_CONVERGED_VOLUMES, STATGROUP_RTXGI);
+		SET_DWORD_STAT(PROBE_VARIABILITY_CONVERGED_VOLUMES, NumConvergedVolumes);
+	}
 #endif
 }
 
@@ -954,6 +980,11 @@ struct RTXGI_API FDDGICustomVersion
 		SaveLoadProbeTextures,     // save pixels and width/height
 		SaveLoadProbeTexturesFmt,  // save texel format since the format can change in the project settings
 		SaveLoadProbeDataIsOptional, // Probe data is optionally stored depending on project settings
+		AddRuntimeModeEnum, // bool RuntimeStatic replaced by EDDGIRuntimeMode RuntimeMode (migrated in PostLoad)
+		OffsetsFloat16, // probe offsets stored as PF_FloatRGBA (signed); older PF_A16B16G16R16 UNORM blobs converted on load
+
+		VersionPlusOne,
+		LatestVersion = VersionPlusOne - 1
 	};
 
 	// The GUID for this custom version number
@@ -965,7 +996,9 @@ private:
 const FGuid FDDGICustomVersion::GUID(0xc12f0537, 0x7346d9c5, 0x336fbba3, 0x738ab145);
 
 // Register the custom version with core
-FCustomVersionRegistration GRegisterCustomVersion(FDDGICustomVersion::GUID, FDDGICustomVersion::SaveLoadProbeDataIsOptional, TEXT("DDGIVolCompVer"));
+// Registered at LatestVersion. It was pinned to AddRuntimeModeEnum, so a newly added version would never be written by
+// saves, and any "< NewVersion" migration would run again on every load.
+FCustomVersionRegistration GRegisterCustomVersion(FDDGICustomVersion::GUID, FDDGICustomVersion::LatestVersion, TEXT("DDGIVolCompVer"));
 
 // Create a CPU accessible GPU texture and copy the provided GPU texture's contents to it
 static FDDGITexturePixels GetTexturePixelsStep1_RenderThread(FRHICommandListImmediate& RHICmdList, FRHITexture* textureGPU)
@@ -987,28 +1020,8 @@ static FDDGITexturePixels GetTexturePixelsStep1_RenderThread(FRHICommandListImme
 	// Create the texture
 	FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, textureGPU->GetFormat());
 
-//#if PLATFORM_PS5
-//	EPixelFormat SourceFormat = textureGPU->GetFormat();
-//	// PS5 might need format conversion
-//	if (SourceFormat == PF_A2B10G10R10)
-//	{
-//		// Convert to a format PS5 definitely supports
-//		SourceFormat = PF_FloatRGBA;
-//	}
-//
-//	FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(
-//		TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, SourceFormat);
-//#else
-	//FRHITextureCreateDesc CreateInfo = FRHITextureCreateDesc::Create2D(
-		//TEXT("DDGIGetTexturePixelsSave"), ret.Desc.Width, ret.Desc.Height, textureGPU->GetFormat());
-//#endif
-
-	CreateInfo.AddFlags(TexCreate_ShaderResource
-
-#if PLATFORM_PS5
-		| TexCreate_CPUReadback
-#endif
-	);
+	// A console-only CPU readback flag and an unused, commented-out format conversion were removed here.
+	CreateInfo.AddFlags(TexCreate_ShaderResource);
 
 	CreateInfo.InitialState = ERHIAccess::CopyDest;
 	ret.Texture = RHICreateTexture(CreateInfo);
@@ -1049,9 +1062,6 @@ static void GetTexturePixelsStep2_RenderThread(FRHICommandListImmediate& RHICmdL
 		return;
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("DDGI GetTexturePixelsStep2 - Locking %dx%d texture"),
-		texturePixels.Desc.Width, texturePixels.Desc.Height);
-
 	// Get a pointer to the CPU memory
 	//uint8* mappedTextureMemory = (uint8*)RHICmdList.LockTexture2D(texturePixels.Texture, 0, RLM_ReadOnly, texturePixels.Desc.Stride, false);
 
@@ -1073,16 +1083,11 @@ static void GetTexturePixelsStep2_RenderThread(FRHICommandListImmediate& RHICmdL
 
 	texturePixels.Desc.Stride = Stride;
 
-	UE_LOG(LogTemp, Warning, TEXT("DDGI GetTexturePixelsStep2 - Stride:%d, Copying %d bytes"),
-		Stride, texturePixels.Desc.Height * Stride);
-
 	// Copy the texture data to CPU memory
 	texturePixels.Pixels.AddZeroed(texturePixels.Desc.Height * texturePixels.Desc.Stride);
 	FMemory::Memcpy(&texturePixels.Pixels[0], mappedTextureMemory, texturePixels.Desc.Height * texturePixels.Desc.Stride);
 
 	RHICmdList.UnlockTexture2D(texturePixels.Texture, 0, false);
-
-	UE_LOG(LogTemp, Warning, TEXT("DDGI GetTexturePixelsStep2 - SUCCESS! Copied %d pixels"), texturePixels.Pixels.Num());
 }
 
 static void SaveFDDGITexturePixels(FArchive& Ar, FDDGITexturePixels& texturePixels, bool bSaveFormat)
@@ -1097,7 +1102,40 @@ static void SaveFDDGITexturePixels(FArchive& Ar, FDDGITexturePixels& texturePixe
 	if (bSaveFormat) Ar << texturePixels.Desc.PixelFormat;
 }
 
-static void LoadFDDGITexturePixels(FArchive& Ar, FDDGITexturePixels& texturePixels, EPixelFormat expectedPixelFormat, bool bLoadFormat)
+static bool ConvertLegacyUnormOffsetsToFloat16(FDDGITexturePixels& texturePixels)
+{
+	const uint32 Width = texturePixels.Desc.Width;
+	const uint32 Height = texturePixels.Desc.Height;
+	const uint32 Stride = texturePixels.Desc.Stride;
+	const uint32 BytesPerTexel = 8;
+
+	if (Width == 0 || Height == 0 || Stride < Width * BytesPerTexel || uint64(texturePixels.Pixels.Num()) != uint64(Height) * uint64(Stride))
+	{
+		return false;
+	}
+
+	for (uint32 Row = 0; Row < Height; ++Row)
+	{
+		uint8* RowData = texturePixels.Pixels.GetData() + uint64(Row) * uint64(Stride);
+		for (uint32 Column = 0; Column < Width; ++Column)
+		{
+			for (uint32 Channel = 0; Channel < 4; ++Channel)
+			{
+				uint8* ChannelData = RowData + Column * BytesPerTexel + Channel * 2;
+				uint16 UnormValue = 0;
+				FMemory::Memcpy(&UnormValue, ChannelData, sizeof(uint16));
+				const uint16 HalfValue = FFloat16(float(UnormValue) / 65535.0f).Encoded;
+				FMemory::Memcpy(ChannelData, &HalfValue, sizeof(uint16));
+			}
+		}
+	}
+
+	texturePixels.Desc.PixelFormat = (uint32)PF_FloatRGBA;
+	return true;
+}
+
+// bLegacyUnormOffsets
+static void LoadFDDGITexturePixels(FArchive& Ar, FDDGITexturePixels& texturePixels, EPixelFormat expectedPixelFormat, bool bLoadFormat, bool bLegacyUnormOffsets = false)
 {
 	check(Ar.IsLoading());
 
@@ -1111,8 +1149,20 @@ static void LoadFDDGITexturePixels(FArchive& Ar, FDDGITexturePixels& texturePixe
 	{
 		Ar << texturePixels.Desc.PixelFormat;
 
+		if (bLegacyUnormOffsets && texturePixels.Desc.PixelFormat == (uint32)FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatOffsetsLegacyUnorm)
+		{
+			ConvertLegacyUnormOffsetsToFloat16(texturePixels);
+		}
+
 		// Early out if the loaded pixel format doesn't match our expected format
 		if (texturePixels.Desc.PixelFormat != expectedPixelFormat) return;
+	}
+	else if (bLegacyUnormOffsets)
+	{
+		if (!ConvertLegacyUnormOffsetsToFloat16(texturePixels))
+		{
+			return;
+		}
 	}
 
 	// Early out if no data was loaded
@@ -1244,6 +1294,24 @@ void UDDGIVolumeComponent::Serialize(FArchive& Ar)
 					Distance = LoadContext.Distance;
 					Offsets = LoadContext.Offsets;
 					States = LoadContext.States;
+
+					auto NeedsPixels = [](const FDDGITexturePixels& TexturePixels)
+					{
+						return TexturePixels.Texture.IsValid() && TexturePixels.Pixels.Num() == 0;
+					};
+					if (NeedsPixels(Irradiance) || NeedsPixels(Distance) || NeedsPixels(Offsets) || NeedsPixels(States))
+					{
+						ENQUEUE_RENDER_COMMAND(DDGISaveTexStep2FromLoadContext)(
+							[&Irradiance, &Distance, &Offsets, &States, NeedsPixels](FRHICommandListImmediate& RHICmdList)
+							{
+								if (NeedsPixels(Irradiance)) GetTexturePixelsStep2_RenderThread(RHICmdList, Irradiance);
+								if (NeedsPixels(Distance)) GetTexturePixelsStep2_RenderThread(RHICmdList, Distance);
+								if (NeedsPixels(Offsets)) GetTexturePixelsStep2_RenderThread(RHICmdList, Offsets);
+								if (NeedsPixels(States)) GetTexturePixelsStep2_RenderThread(RHICmdList, States);
+							}
+						);
+						FlushRenderingCommands();
+					}
 				}
 
 				// Write the volume data
@@ -1267,9 +1335,11 @@ void UDDGIVolumeComponent::Serialize(FArchive& Ar)
 				bool bLoadFormat = Ar.CustomVer(FDDGICustomVersion::GUID) >= FDDGICustomVersion::SaveLoadProbeTexturesFmt;
 
 				// Read the volume texture data in and note that it's ready for load
-				LoadFDDGITexturePixels(Ar, LoadContext.Irradiance, (IrradianceBits == EDDGIIrradianceBits::n32) ? FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatIrradianceHighBitDepth : FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatIrradianceLowBitDepth, bLoadFormat);
+				LoadFDDGITexturePixels(Ar, LoadContext.Irradiance, GetDDGIIrradiancePixelFormat(IrradianceBits), bLoadFormat);
 				LoadFDDGITexturePixels(Ar, LoadContext.Distance, (DistanceBits == EDDGIDistanceBits::n32) ? FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatDistanceHighBitDepth : FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatDistanceLowBitDepth, bLoadFormat);
-				LoadFDDGITexturePixels(Ar, LoadContext.Offsets, FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatOffsets, bLoadFormat);
+				// Offsets saved before OffsetsFloat16 are UNORM: with a format tag the tag decides, and files without a tag
+				// predate SaveLoadProbeTexturesFmt, when offsets were always PF_A16B16G16R16.
+				LoadFDDGITexturePixels(Ar, LoadContext.Offsets, FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatOffsets, bLoadFormat, /*bLegacyUnormOffsets*/ Ar.CustomVer(FDDGICustomVersion::GUID) < FDDGICustomVersion::OffsetsFloat16);
 				LoadFDDGITexturePixels(Ar, LoadContext.States, FDDGIVolumeSceneProxy::FComponentData::c_pixelFormatStates, bLoadFormat);
 
 				bool& ReadyForLoad = LoadContext.ReadyForLoad;
@@ -1282,6 +1352,47 @@ void UDDGIVolumeComponent::Serialize(FArchive& Ar)
 			}
 		}
 	}
+}
+
+void UDDGIVolumeComponent::PostLoad()
+{
+	Super::PostLoad();
+
+	// Migrate the deprecated bool RuntimeStatic to EDDGIRuntimeMode RuntimeMode for assets saved
+	// before AddRuntimeModeEnum. Newer assets store RuntimeMode directly and are left untouched.
+	if (GetLinkerCustomVersion(FDDGICustomVersion::GUID) < FDDGICustomVersion::AddRuntimeModeEnum)
+	{
+		RuntimeMode = RuntimeStatic_DEPRECATED ? EDDGIRuntimeMode::Static : EDDGIRuntimeMode::Dynamic;
+	}
+}
+
+static bool DDGIComponentDataChangesProbes(const FDDGIVolumeSceneProxy::FComponentData& A, const FDDGIVolumeSceneProxy::FComponentData& B)
+{
+	return !A.Transform.Equals(B.Transform, 0.0f)
+		|| A.Origin != B.Origin
+		|| A.RaysPerProbe != B.RaysPerProbe
+		|| A.ProbeMaxRayDistance != B.ProbeMaxRayDistance
+		|| A.ProbeCounts != B.ProbeCounts
+		|| A.ProbeDistanceExponent != B.ProbeDistanceExponent
+		|| A.ProbeIrradianceEncodingGamma != B.ProbeIrradianceEncodingGamma
+		|| A.ProbeHysteresis != B.ProbeHysteresis
+		|| A.ProbeChangeThreshold != B.ProbeChangeThreshold
+		|| A.ProbeBrightnessThreshold != B.ProbeBrightnessThreshold
+		|| A.NormalBias != B.NormalBias
+		|| A.ViewBias != B.ViewBias
+		|| A.ProbeBackfaceThreshold != B.ProbeBackfaceThreshold
+		|| A.ProbeRandomRayBackfaceThreshold != B.ProbeRandomRayBackfaceThreshold
+		|| A.ProbeMinFrontfaceDistance != B.ProbeMinFrontfaceDistance
+		|| A.EnableProbeRelocation != B.EnableProbeRelocation
+		|| A.EnableProbeScrolling != B.EnableProbeScrolling
+		|| A.EnableVolume != B.EnableVolume
+		|| A.ProbeScrollOffsets != B.ProbeScrollOffsets
+		|| A.IrradianceScalar != B.IrradianceScalar
+		|| A.EmissiveMultiplier != B.EmissiveMultiplier
+		|| A.RuntimeMode != B.RuntimeMode
+		|| A.SkyLightTypeOnRayMiss != B.SkyLightTypeOnRayMiss
+		|| A.EnableProbeVariability != B.EnableProbeVariability
+		|| A.VariabilityThreshold != B.VariabilityThreshold;
 }
 
 void UDDGIVolumeComponent::UpdateRenderThreadData()
@@ -1336,6 +1447,7 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 		ComponentData.BlendDistance = BlendingDistance;
 		ComponentData.BlendDistanceBlack = BlendingCutoffDistance;
 		ComponentData.ProbeBackfaceThreshold = ProbeRelocation.ProbeBackfaceThreshold;
+		ComponentData.ProbeRandomRayBackfaceThreshold = ProbeRelocation.ProbeRandomRayBackfaceThreshold;
 		ComponentData.ProbeMinFrontfaceDistance = ProbeRelocation.ProbeMinFrontfaceDistance;
 		ComponentData.EnableProbeRelocation = ProbeRelocation.AutomaticProbeRelocation;
 		ComponentData.EnableProbeScrolling = ScrollProbesInfinitely;
@@ -1344,8 +1456,10 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 		ComponentData.IrradianceScalar = IrradianceScalar;
 		ComponentData.EmissiveMultiplier = EmissiveMultiplier;
 		ComponentData.LightingMultiplier = LightMultiplier;
-		ComponentData.RuntimeStatic = RuntimeStatic;
+		ComponentData.RuntimeMode = RuntimeMode; // Tri-state runtime mode
 		ComponentData.SkyLightTypeOnRayMiss = SkyLightTypeOnRayMiss;
+		ComponentData.EnableProbeVariability = bEnableProbeVariability;
+		ComponentData.VariabilityThreshold = VariabilityThreshold;
 
 		if (ScrollProbesInfinitely)
 		{
@@ -1384,7 +1498,7 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 				// Update the probe scroll offset count
 				ProbeScrollOffset.X += Translation.X;
 				ProbeScrollOffset.Y += Translation.Y;
-				ProbeScrollOffset.X += Translation.Z;
+				ProbeScrollOffset.Z += Translation.Z;
 			}
 
 			// Set the probe scroll offsets.
@@ -1439,27 +1553,59 @@ void UDDGIVolumeComponent::UpdateRenderThreadData()
 			{
 				FMemMark Mark(FMemStack::Get());
 				FRDGBuilder GraphBuilder(RHICmdList);
-		
-				bool needReallocate =
-					DDGIProxy->ComponentData.ProbeCounts != ComponentData.ProbeCounts ||
-					DDGIProxy->ComponentData.RaysPerProbe != ComponentData.RaysPerProbe ||
-					DDGIProxy->ComponentData.EnableProbeRelocation != ComponentData.EnableProbeRelocation;
-		
+
+				const FDDGIVolumeSceneProxy::FComponentData& PrevData = DDGIProxy->ComponentData;
+
+				const bool bFullReset =
+					PrevData.ProbeCounts != ComponentData.ProbeCounts ||
+					PrevData.RaysPerProbe != ComponentData.RaysPerProbe;
+				const bool bRelocationToggled = PrevData.EnableProbeRelocation != ComponentData.EnableProbeRelocation;
+				const bool bVariabilityToggled = PrevData.EnableProbeVariability != ComponentData.EnableProbeVariability;
+				const bool needReallocate = bFullReset || bRelocationToggled || bVariabilityToggled;
+
+				// Anything that changes what the probes trace or store restarts variability convergence. Kept on the proxy,
+				// not in ComponentData, so a later command can't overwrite a request the per-frame update hasn't consumed.
+				if (DDGIComponentDataChangesProbes(PrevData, ComponentData) || TextureLoadContext.ReadyForLoad)
+				{
+					DDGIProxy->bVariabilityResetRequested = true;
+				}
+
+				// An ISV scroll's forced update must survive a second command landing before the per-frame update runs
+				const bool bPendingForceUpdate = PrevData.bForceUpdate;
+
 				// Now assign the new data
 				DDGIProxy->ComponentData = ComponentData;
-		
+				DDGIProxy->ComponentData.bForceUpdate |= bPendingForceUpdate;
+
 				// Handle state textures ready to load from serialization
 				if (TextureLoadContext.ReadyForLoad)
 					DDGIProxy->TextureLoadContext = TextureLoadContext;
-		
+
 				if (needReallocate)
 				{
 					//DDGIProxy->TextureLoadContext.Clear();
 					DDGIProxy->ReallocateSurfaces_RenderThread(RHICmdList, IrradianceBits, DistanceBits);
-					DDGIProxy->ResetTextures_RenderThread(GraphBuilder);
+					if (bFullReset)
+					{
+						DDGIProxy->ResetTextures_RenderThread(GraphBuilder);
+					}
+					else
+					{
+						// Pooled textures come back with stale contents
+						float ClearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+						if (bRelocationToggled && DDGIProxy->ProbesOffsets)
+						{
+							AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(DDGIProxy->ProbesOffsets)), ClearColor);
+						}
+						if (bVariabilityToggled && DDGIProxy->ProbesVariability)
+						{
+							AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalTexture(DDGIProxy->ProbesVariability)), ClearColor);
+						}
+						DDGIProxy->bVariabilityResetRequested = true;
+					}
 					FDDGIVolumeSceneProxy::AllProxiesReadyForRender_RenderThread.Add(DDGIProxy);
 				}
-		
+
 				GraphBuilder.Execute();
 			}
 		);
@@ -1519,13 +1665,7 @@ bool UDDGIVolumeComponent::CanEditChange(const FProperty* InProperty) const
 				return false;
 			}
 		}
-		else if (PropertyName == GET_MEMBER_NAME_STRING_CHECKED(FProbeRelocation, ProbeBackfaceThreshold))
-		{
-			if (!ProbeRelocation.AutomaticProbeRelocation)
-			{
-				return false;
-			}
-		}
+		// The fixed-ray threshold also drives probe classification, which runs whether or not relocation is enabled
 	}
 
 	return Super::CanEditChange(InProperty);
@@ -1632,6 +1772,8 @@ void UDDGIVolumeComponent::DestroyRenderState_Concurrent()
 					}
 				}
 
+			// Variability readback passes hold raw pointers to the proxy's readbacks and may still be running in RDG chained async execution task.
+			FRDGBuilder::WaitForAsyncExecuteTask();
 			delete DDGIProxy;
 			}
 		);

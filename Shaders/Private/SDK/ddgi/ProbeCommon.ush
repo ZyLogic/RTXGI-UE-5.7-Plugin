@@ -16,11 +16,9 @@
 #include "../DDGIVolumeDefines.ush"
 #include "../DDGIVolumeDescGPU.ush"
 
-#if RTXGI_DDGI_PROBE_RELOCATION || RTXGI_DDGI_PROBE_CLASSIFICATION
 // The number of fixed rays that are used for probe relocation and classification.
 // These rays do not vary to produce temporally stable results during relocation and classification.
 #define RTXGI_DDGI_NUM_FIXED_RAYS 32
-#endif
 
 //------------------------------------------------------------------------
 // Probe Indexing Helpers
@@ -86,11 +84,7 @@ int2 DDGIGetProbeTexelPosition(int probeIndex, int3 probeGridCounts)
 * using the probe index, octant coordinates, probe grid counts,
 * and the number of texels used by a probe.
 */
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
 float2 DDGIGetProbeUV(uint probeIndex, float2 octantCoordinates, int3 probeGridCounts, int numTexels, int3 probeScrollOffsets)
-#else
-float2 DDGIGetProbeUV(uint probeIndex, float2 octantCoordinates, int3 probeGridCounts, int numTexels)
-#endif
 {
     int probesPerPlane = DDGIGetProbesPerPlane(probeGridCounts);
     int planeIndex = int(probeIndex / probesPerPlane);
@@ -101,31 +95,25 @@ float2 DDGIGetProbeUV(uint probeIndex, float2 octantCoordinates, int3 probeGridC
 #if RTXGI_COORDINATE_SYSTEM == RTXGI_COORDINATE_SYSTEM_LEFT || RTXGI_COORDINATE_SYSTEM == RTXGI_COORDINATE_SYSTEM_RIGHT
     int gridSpaceX = (probeIndex % probeGridCounts.x);
     int gridSpaceY = (probeIndex / probeGridCounts.x);
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
     gridSpaceX = (gridSpaceX + probeScrollOffsets.x) % probeGridCounts.x;
     gridSpaceY = (gridSpaceY + probeScrollOffsets.z) % probeGridCounts.z;
     planeIndex = (planeIndex + probeScrollOffsets.y) % probeGridCounts.y;
-#endif
     int x = gridSpaceX + (planeIndex * probeGridCounts.x);
     int y = gridSpaceY % probeGridCounts.z;
 #elif RTXGI_COORDINATE_SYSTEM == RTXGI_COORDINATE_SYSTEM_LEFT_Z_UP
     int gridSpaceX = (probeIndex % probeGridCounts.y);
     int gridSpaceY = (probeIndex / probeGridCounts.y);
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
     gridSpaceX = (gridSpaceX + probeScrollOffsets.y) % probeGridCounts.y;
     gridSpaceY = (gridSpaceY + probeScrollOffsets.x) % probeGridCounts.x;
     planeIndex = (planeIndex + probeScrollOffsets.z) % probeGridCounts.z;
-#endif
     int x = gridSpaceX + (planeIndex * probeGridCounts.y);
     int y = gridSpaceY % probeGridCounts.x;
 #elif  RTXGI_COORDINATE_SYSTEM == RTXGI_COORDINATE_SYSTEM_RIGHT_Z_UP
     int gridSpaceX = (probeIndex % probeGridCounts.x);
     int gridSpaceY = (probeIndex / probeGridCounts.x);
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
     gridSpaceX = (gridSpaceX + probeScrollOffsets.x) % probeGridCounts.x;
     gridSpaceY = (gridSpaceY + probeScrollOffsets.y) % probeGridCounts.y;
     planeIndex = (planeIndex + probeScrollOffsets.z) % probeGridCounts.z;
-#endif
     int x = gridSpaceX + (planeIndex * probeGridCounts.x);
     int y = gridSpaceY % probeGridCounts.y;
 #endif
@@ -145,6 +133,12 @@ float2 DDGIGetProbeUV(uint probeIndex, float2 octantCoordinates, int3 probeGridC
     uv += octantCoordinates.xy * (probeInteriorTexels * 0.5f);
     uv /= float2(textureWidth, textureHeight);
     return uv;
+}
+
+
+float2 DDGIGetProbeUV(uint probeIndex, float2 octantCoordinates, int3 probeGridCounts, int numTexels)
+{
+    return DDGIGetProbeUV(probeIndex, octantCoordinates, probeGridCounts, numTexels, int3(0, 0, 0));
 }
 
 /**
@@ -224,7 +218,6 @@ float3 DDGISphericalFibonacci(float index, float numSamples)
 */
 float3 DDGIGetProbeRayDirection(int rayIndex, int numRaysPerProbe, float4x4 rotationTransform)
 {
-#if RTXGI_DDGI_PROBE_RELOCATION || RTXGI_DDGI_PROBE_CLASSIFICATION
     bool useFixedRays = rayIndex < RTXGI_DDGI_NUM_FIXED_RAYS;
     int  adjustedRayIndex = useFixedRays ? rayIndex : rayIndex - RTXGI_DDGI_NUM_FIXED_RAYS;
     int  adjustedNumRays = useFixedRays ? min(RTXGI_DDGI_NUM_FIXED_RAYS, numRaysPerProbe) : numRaysPerProbe - RTXGI_DDGI_NUM_FIXED_RAYS;
@@ -235,9 +228,6 @@ float3 DDGIGetProbeRayDirection(int rayIndex, int numRaysPerProbe, float4x4 rota
         // Don't rotate the fixed rays so that relocation/classification is temporally stable
         return normalize(direction);
     }
-#else
-    float3 direction = DDGISphericalFibonacci(rayIndex, numRaysPerProbe);
-#endif
     return normalize(mul(float4(direction, 0.f), rotationTransform).xyz);
 }
 
@@ -388,8 +378,6 @@ float3 DDGIGetProbeWorldPosition(int probeIndex, float3 origin, float4 rotation,
 // Probe Relocation
 //------------------------------------------------------------------------
 
-#if RTXGI_DDGI_PROBE_RELOCATION
-
 /*
 * Reads the probe offset and transforms it into a world space offset.
 */
@@ -439,24 +427,20 @@ float3 DDGIGetProbeWorldPositionWithOffset(int3 probeCoords, float3 origin, floa
     return DDGIGetProbeWorldPositionWithOffset(probeIndex, origin, rotation, probeGridCounts, probeGridSpacing, probeOffsets);
 }
 
-#endif // RTXGI_DDGI_PROBE_RELOCATION
 
 //------------------------------------------------------------------------
 // Probe State Classification
 //------------------------------------------------------------------------
 
-#if RTXGI_DDGI_PROBE_CLASSIFICATION
 
 #define PROBE_STATE_ACTIVE      0   // probe shoots rays and may be sampled by a front facing surface or another probe (recursive irradiance)
 #define PROBE_STATE_INACTIVE    1   // probe doesn't need to shoot rays, it isn't near a front facing surface or another active probe
 
-#endif // RTXGI_DDGI_PROBE_CLASSIFICATION
 
 //------------------------------------------------------------------------
 // Volume Scrolling Movement
 //------------------------------------------------------------------------
 
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
 
 /**
 * Gets the index of a probe that is offset from a base probe
@@ -469,7 +453,6 @@ int DDGIGetProbeIndexOffset(int baseProbeIndex, int3 probeGridCounts, int3 probe
     return offsetProbeIndex;
 }
 
-#if RTXGI_DDGI_PROBE_RELOCATION
 // Modified versions of the GetProbeWorldPositionWithOffset functions that account for probeScrollOffsets
 
 /*
@@ -501,8 +484,5 @@ float3 DDGIGetProbeWorldPositionWithOffset(int3 probeCoords, float3 origin, floa
     int probeIndex = DDGIGetProbeIndex(probeCoords, probeGridCounts);
     return DDGIGetProbeWorldPositionWithOffset(probeIndex, origin, rotation, probeGridCounts, probeGridSpacing, probeScrollOffsets, probeOffsets);
 }
-#endif
-
-#endif // RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
 
 #endif // RTXGI_DDGI_PROBE_COMMON_HLSL

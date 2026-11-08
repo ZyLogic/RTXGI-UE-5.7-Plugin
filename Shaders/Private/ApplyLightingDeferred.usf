@@ -53,9 +53,11 @@ uint                NumVolumes;
     float  DDGIVolume_##x##_ViewBias; \
     float  DDGIVolume_##x##_BlendDistance; \
     float  DDGIVolume_##x##_BlendDistanceBlack; \
-    float  DDGIVolume_##x##_ApplyLighting; \
     int3   DDGIVolume_##x##_ProbeScrollOffsets; \
-    float  DDGIVolume_##x##_IrradianceScalar;
+    float  DDGIVolume_##x##_IrradianceScalar; \
+    int    DDGIVolume_##x##_ProbeRelocationEnabled; \
+    int    DDGIVolume_##x##_ProbeIrradianceFormat;
+// Probe relocation  and scrlling are runtime per-volume values now, so one dispatch shades every volume, instead of one dispatch per shader permutation
 VOLUME_LIST
 #undef VOLUME_ENTRY
 
@@ -74,7 +76,6 @@ float4 ApplyVolumeLightingContribution(
     float3 Albedo,
     float BlendDistance,
     float BlendDistanceBlack,
-    float ApplyLighting,
     float IrradianceScalar)
 {
     // Ignore the DDGIVolume if the lighting mask doesn't overlap
@@ -92,7 +93,6 @@ float4 ApplyVolumeLightingContribution(
     float4 LightWeight = 0.f;
 
     // Get irradiance from the DDGIVolume
-    if (ApplyLighting > 0.0f)
     {
         // Fill out a DDGIVolumeResources
         DDGIVolumeResources Resources;
@@ -100,12 +100,8 @@ float4 ApplyVolumeLightingContribution(
             Resources.probeIrradianceSRV = ProbeIrradiance;
             Resources.probeDistanceSRV = ProbeDistance;
             Resources.bilinearSampler = LinearClampSampler;
-        #if RTXGI_DDGI_PROBE_RELOCATION
             Resources.probeOffsetsSRV = ProbeOffsets;
-        #endif
-        #if RTXGI_DDGI_PROBE_CLASSIFICATION
             Resources.probeStatesSRV = ProbeStates;
-        #endif
         }
 
         float3 SurfaceBias = DDGIGetSurfaceBias(Normal, CameraDirection, Volume);
@@ -118,10 +114,6 @@ float4 ApplyVolumeLightingContribution(
         );
 
         LightWeight.rgb = Irradiance * (Albedo / RTXGI_PI) / IrradianceScalar;
-    }
-    else
-    {
-        LightWeight.rgb = float3(0.0f, 0.0f, 0.0f);
     }
 
     float3 EdgeDist = (VolumeRadius - abs(RelPos));
@@ -176,8 +168,11 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     #endif
 
     // Make DDGIVolumeDescGPU's. Rely on inlining and deadstripping to make this a noop.
+    // The descriptor carries the runtime relocation and irradiance format values.
     #define VOLUME_ENTRY(x) \
-        DDGIVolumeDescGPU DDGIVolume_##x; \
+        DDGIVolumeDescGPU DDGIVolume_##x = (DDGIVolumeDescGPU)0; \
+        DDGIVolume_##x.probeRelocationEnabled = DDGIVolume_##x##_ProbeRelocationEnabled; \
+        DDGIVolume_##x.probeIrradianceFormat = DDGIVolume_##x##_ProbeIrradianceFormat; \
         DDGIVolume_##x.origin = DDGIVolume_##x##_Position; \
         DDGIVolume_##x.rotation = DDGIVolume_##x##_Rotation; \
         DDGIVolume_##x.probeGridSpacing = DDGIVolume_##x##_ProbeGridSpacing; \
@@ -218,7 +213,6 @@ void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
                 Albedo, \
                 DDGIVolume_##x##_BlendDistance, \
                 DDGIVolume_##x##_BlendDistanceBlack, \
-                DDGIVolume_##x##_ApplyLighting, \
                 DDGIVolume_##x##_IrradianceScalar); \
             \
             if (AccLightWeight.a == 0.f) \

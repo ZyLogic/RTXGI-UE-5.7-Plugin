@@ -57,18 +57,18 @@ then "vis DDGIProbesTexture" to see the texture
 // START RGS PARAMS
 RaytracingAccelerationStructure TLAS;
 
-uint        FrameRandomSeed;
+uint FrameRandomSeed;
 
-float3      CameraPos;
-float4x4    CameraMatrix;
+float3 CameraPos;
+float4x4 CameraMatrix;
 
-float       DDGIVolume_PreExposure;
-uint        DDGIVolume_ShouldUsePreExposure;
-float       DDGIVolume_IrradianceScalar;
+float DDGIVolume_PreExposure;
+uint DDGIVolume_ShouldUsePreExposure;
+float DDGIVolume_IrradianceScalar;
 
-float3              Sky_Color;
+float3 Sky_Color;
 TextureCube<float4> Sky_Texture;
-SamplerState        Sky_TextureSampler;
+SamplerState Sky_TextureSampler;
 
 RWTexture2D<float4> RadianceOutput;
 
@@ -83,43 +83,46 @@ float3 GetEnvironmentalRadiance(in float3 direction)
 // It isn't sampling DDGI volumes though so is only direct lighting.
 RAY_TRACING_ENTRY_RAYGEN(ProbeViewRGS)
 {
-    uint2 DispatchIndex = DispatchRaysIndex().xy;
+uint2 DispatchIndex = DispatchRaysIndex().xy;
 
     // This is to make the radiance be in a viewable range
-    float radianceMultiplier = DDGIVolume_ShouldUsePreExposure ? DDGIVolume_PreExposure : 1.0f;
+float radianceMultiplier = DDGIVolume_ShouldUsePreExposure ? DDGIVolume_PreExposure : 1.0f;
 
-    FRayDesc Ray;
-    Ray.Origin = CameraPos;
-    float3 rayTarget = float3(float2(DispatchIndex.xy) / float2(DispatchRaysDimensions().xy) * 2.0f - 1.0f, 1.0f);
+FRayDesc Ray;
+float3 cameraTranslatedWorldPos = DFFastToTranslatedWorld(CameraPos, PrimaryView.PreViewTranslation);
+    Ray.Origin =
+cameraTranslatedWorldPos;
+float3 rayTarget = float3(float2(DispatchIndex.xy) / float2(DispatchRaysDimensions().xy) * 2.0f - 1.0f, 1.0f);
     rayTarget.y *= -1.0f;
-    float3 rayDir = mul(float4(normalize(rayTarget), 0.0f), CameraMatrix).xyz;
-    Ray.Direction = rayDir;
+float3 rayDir = mul(float4(normalize(rayTarget), 0.0f), CameraMatrix).xyz;
+    Ray.Direction =
+rayDir;
     Ray.TMin = 0.f;
     Ray.TMax = 10000.0f;
 
-    const int ReflectedShadowsType = 1; // = hard shadows.  make configurable?
-    const uint RayFlags = 0;
-    const uint InstanceInclusionMask = RAY_TRACING_MASK_ALL;
-    const bool bShouldDoDirectLighting = true;
-    const bool bShouldDoEmissiveAndIndirectLighting = true;
-    const bool bRayTraceSkyLightContribution = false;
-    const bool bDecoupleSampleGeneration = true;
-    const bool bEnableSkyLightContribution = false;
-    float3 PathVertexRadiance = float3(0, 0, 0);
-    FRayCone RayCone = (FRayCone)0;
-    float MaxNormalBias = 0.01f;
+const int ReflectedShadowsType = 1; // = hard shadows.  make configurable?
+const uint RayFlags = 0;
+const uint InstanceInclusionMask = RAY_TRACING_MASK_ALL;
+const bool bShouldDoDirectLighting = true;
+const bool bShouldDoEmissiveAndIndirectLighting = true;
+const bool bRayTraceSkyLightContribution = false;
+const bool bDecoupleSampleGeneration = true;
+const bool bEnableSkyLightContribution = false;
+float3 PathVertexRadiance = float3(0, 0, 0);
+FRayCone RayCone = (FRayCone) 0;
+float MaxNormalBias = 0.01f;
 
     // Trace
-    uint linear_rand = DispatchIndex.x + DispatchIndex.y * 9973;
-    RandomSequence RandSequence;
+uint linear_rand = DispatchIndex.x + DispatchIndex.y * 9973;
+RandomSequence RandSequence;
     RandomSequence_Initialize(RandSequence, linear_rand, FrameRandomSeed);
-    uint2 PixelCoord = DispatchRaysIndex().xy;
+uint2 PixelCoord = DispatchRaysIndex().xy;
 
-	RaytracingAccelerationStructure FarFieldTLAS = TLAS;
-	float MaxTraceDistance = Ray.TMax;
-	const bool bIsCameraRay = true; // This is a camera ray for the probe view
+RaytracingAccelerationStructure FarFieldTLAS = TLAS;
+float MaxTraceDistance = Ray.TMax;
+const bool bIsCameraRay = true; // This is a camera ray for the probe view
 
-	FMaterialClosestHitPayload Payload = TraceRayAndAccumulateResults(
+FMaterialClosestHitPayload Payload = TraceRayAndAccumulateResults(
 		Ray,
 		TLAS,
 		FarFieldTLAS,
@@ -140,7 +143,7 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeViewRGS)
 		bEnableSkyLightContribution,
 		PathVertexRadiance);
 
-    float4 result = float4(PathVertexRadiance.xyz, Payload.HitT);
+float4 result = float4(PathVertexRadiance.xyz, Payload.HitT);
 
 #if VOLUME_DEBUG_VIEW == 0
 
@@ -156,7 +159,7 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeViewRGS)
     }
 
     // Hit a surface backface. Set the radiance to black and exit early.
-    if (!Payload.IsFrontFace() && Payload.ShadingModelID != SHADINGMODELID_TWOSIDED_FOLIAGE)
+    if (!Payload.IsFrontFace() && !Payload.IsTwoSided())
     {
         // Shorten the hit distance on a backface hit by 20%
         // Make distance negative to encode backface for the probe position preprocess.
@@ -175,7 +178,7 @@ RAY_TRACING_ENTRY_RAYGEN(ProbeViewRGS)
     }
     else
     {
-        if (Payload.IsFrontFace() || Payload.ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE)
+        if (Payload.IsFrontFace() || Payload.IsTwoSided())
             RadianceOutput[DispatchIndex.xy] = float4(0.0f, 1.0f, 0.0f, Payload.HitT);
         else
             RadianceOutput[DispatchIndex.xy] = float4(1.0f, 0.0f, 0.0f, Payload.HitT);

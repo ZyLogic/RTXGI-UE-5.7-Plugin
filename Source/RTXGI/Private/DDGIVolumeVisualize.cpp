@@ -18,6 +18,7 @@
 #include "ShaderParameterStruct.h"
 #include "ShaderParameterUtils.h"
 #include "SystemTextures.h"
+#include "Engine/Level.h"
 
 // UE private interfaces
 #include "DataDrivenShaderPlatformInfo.h"
@@ -52,6 +53,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVolumeVisualizeShaderParameters, )
 	SHADER_PARAMETER(int32, ShouldUsePreExposure)
 	SHADER_PARAMETER(FIntVector, VolumeProbeScrollOffsets)
 	SHADER_PARAMETER(float, IrradianceScalar)
+	SHADER_PARAMETER(int32, VolumeProbeRelocationEnabled)
+	SHADER_PARAMETER(int32, VolumeProbeIrradianceFormat)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ProbeVariability)
+	SHADER_PARAMETER(int32, VolumeProbeVariabilityEnabled)
+	SHADER_PARAMETER(float, VariabilityThreshold)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
@@ -63,11 +69,6 @@ public:
 
 	using FParameters = FVolumeVisualizeShaderParameters;
 
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-
-	using FPermutationDomain = TShaderPermutationDomain<FEnableRelocation, FEnableScrolling>;
-
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
@@ -79,7 +80,7 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return IsFeatureLevelSupported(Parameters.Platform, GMaxRHIFeatureLevel);
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 	}
 };
 
@@ -91,13 +92,6 @@ public:
 
 	using FParameters = FVolumeVisualizeShaderParameters;
 
-	class FEnableRelocation : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_PROBE_RELOCATION");
-	class FEnableScrolling : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_INFINITE_SCROLLING_VOLUME");
-	class FFormatRadiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_RADIANCE");
-	class FFormatIrradiance : SHADER_PERMUTATION_BOOL("RTXGI_DDGI_FORMAT_IRRADIANCE");
-
-	using FPermutationDomain = TShaderPermutationDomain<FEnableRelocation, FEnableScrolling, FFormatRadiance, FFormatIrradiance>;
-
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
@@ -109,7 +103,7 @@ public:
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return IsFeatureLevelSupported(Parameters.Platform, GMaxRHIFeatureLevel);
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 	}
 };
 
@@ -172,16 +166,23 @@ public:
 		// Create vertex buffer. Fill buffer with initial data upon creation
 #if ENGINE_MAJOR_VERSION < 5
 		FRHIResourceCreateInfo CreateInfo(&Verts);
-#else
-		FRHIResourceCreateInfo CreateInfo(TEXT("TDDGIProbeSphereVertexBuffer"), &Verts);
-#endif
 		VertexBufferRHI = RHICmdList.CreateVertexBuffer(Size, BUF_Static, CreateInfo);
+#else
+		const FRHIBufferCreateDesc CreateDesc
+			= FRHIBufferCreateDesc::CreateVertex(TEXT("TDDGIProbeSphereVertexBuffer"), Size)
+			.AddUsage(EBufferUsageFlags::Static)
+			.SetInitActionResourceArray(&Verts)
+			.DetermineInitialState();
+
+		VertexBufferRHI = RHICmdList.CreateBuffer(CreateDesc);
+#endif
+
 	}
 
 	int32 GetVertexCount() const { return NumSphereVerts; }
 
 private:
-	int32 NumSphereVerts;
+	int32 NumSphereVerts{};
 };
 
 /**
@@ -224,16 +225,23 @@ public:
 		// Create index buffer. Fill buffer with initial data upon creation
 #if ENGINE_MAJOR_VERSION < 5
 		FRHIResourceCreateInfo CreateInfo(&Indices);
-#else
-		FRHIResourceCreateInfo CreateInfo(TEXT("TDDGIProbeSphereIndexBuffer"), &Indices);
-#endif
 		IndexBufferRHI = RHICmdList.CreateIndexBuffer(Stride, Size, BUF_Static, CreateInfo);
+#else
+		const FRHIBufferCreateDesc CreateDesc
+			= FRHIBufferCreateDesc::CreateIndex(TEXT("TDDGIProbeSphereIndexBuffer"), Size, Stride)
+			.AddUsage(EBufferUsageFlags::Static)
+			.SetInitActionResourceArray(&Indices)
+			.DetermineInitialState();
+
+		IndexBufferRHI = RHICmdList.CreateBuffer(CreateDesc);
+#endif
+
 	}
 
 	int32 GetIndexCount() const { return NumIndices; };
 
 private:
-	int32 NumIndices;
+	int32 NumIndices{};
 };
 
 struct FVisualDDGIProbesVertex
@@ -278,7 +286,9 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectVisualizations_RenderThread(
 	check(IsInRenderingThread() || IsInParallelRenderingThread());
 
 	int mode = static_cast<int>(GetDefault<URTXGIPluginSettings>()->ProbesVisualization);
-	if (mode < 1 || mode > 3) return;
+	// Mode 4: Probe Variability
+	if (mode < 1 || mode > 4) return;
+	const bool bLowBitDepthIrradiance = IsDDGIIrradianceLowBitDepth(GetDefault<URTXGIPluginSettings>()->IrradianceBits);
 
 	RDG_GPU_STAT_SCOPE(GraphBuilder, RTXGI_Visualizations);
 	RDG_EVENT_SCOPE(GraphBuilder, "RTXGI Visualizations");
@@ -310,23 +320,10 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectVisualizations_RenderThread(
 		// Skip this volume if it doesn't intersect the view frustum
 		if (!proxy->IntersectsViewFrustum(View)) continue;
 
-		// Get the shader permutation
-		FVolumeVisualizeShaderVS::FPermutationDomain PermutationVectorVS;
-		PermutationVectorVS.Set<FVolumeVisualizeShaderVS::FEnableRelocation>(proxy->ComponentData.EnableProbeRelocation);
-		PermutationVectorVS.Set<FVolumeVisualizeShaderVS::FEnableScrolling>(proxy->ComponentData.EnableProbeScrolling);
-
-		FVolumeVisualizeShaderPS::FPermutationDomain PermutationVectorPS;
-		PermutationVectorPS.Set<FVolumeVisualizeShaderPS::FEnableRelocation>(proxy->ComponentData.EnableProbeRelocation);
-		PermutationVectorPS.Set<FVolumeVisualizeShaderPS::FEnableScrolling>(proxy->ComponentData.EnableProbeScrolling);
-		bool highBitCount = (GetDefault<URTXGIPluginSettings>()->IrradianceBits == EDDGIIrradianceBits::n32);
-		PermutationVectorPS.Set<FVolumeVisualizeShaderPS::FFormatRadiance>(highBitCount);
-		PermutationVectorPS.Set<FVolumeVisualizeShaderPS::FFormatIrradiance>(highBitCount);
-		//EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[ERHIFeatureLevel::SM5];
-
 		FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
-		TShaderMapRef<FVolumeVisualizeShaderVS> VertexShader(GlobalShaderMap, PermutationVectorVS);
-		TShaderMapRef<FVolumeVisualizeShaderPS> PixelShader(GlobalShaderMap, PermutationVectorPS);
+		TShaderMapRef<FVolumeVisualizeShaderVS> VertexShader(GlobalShaderMap);
+		TShaderMapRef<FVolumeVisualizeShaderPS> PixelShader(GlobalShaderMap);
 
 		// Set shader pass parameters
 		FVolumeVisualizeShaderParameters DefaultPassParameters;
@@ -347,6 +344,12 @@ void FDDGIVolumeSceneProxy::RenderDiffuseIndirectVisualizations_RenderThread(
 		PassParameters->IrradianceScalar = proxy->ComponentData.IrradianceScalar;
 
 		PassParameters->VolumeProbeScrollOffsets = proxy->ComponentData.ProbeScrollOffsets;
+
+		PassParameters->VolumeProbeRelocationEnabled = (proxy->ComponentData.EnableProbeRelocation && proxy->ProbesOffsets.IsValid()) ? 1 : 0;
+		PassParameters->VolumeProbeIrradianceFormat = bLowBitDepthIrradiance ? 0 : 1;
+		PassParameters->VolumeProbeVariabilityEnabled = (proxy->ComponentData.EnableProbeVariability && proxy->ProbesVariability.IsValid()) ? 1 : 0;
+		PassParameters->ProbeVariability = RegisterExternalTextureWithFallback(GraphBuilder, proxy->ProbesVariability, GSystemTextures.BlackDummy);
+		PassParameters->VariabilityThreshold = proxy->ComponentData.VariabilityThreshold;
 
 		PassParameters->ProbeSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		PassParameters->Mode = mode;
@@ -430,6 +433,8 @@ static bool MemoryUseExec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 		int distanceBytes = 0;
 		int offsetsBytes = 0;
 		int statesBytes = 0;
+		int scrollSpaceBytes = 0;
+		int variabilityBytes = 0;
 	};
 
 	TArray<VolumeMemoryInfo> memoryInfo;
@@ -453,12 +458,13 @@ static bool MemoryUseExec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 						info.irradianceBytes = texture->GetSizeX()* texture->GetSizeY()* GPixelFormats[texture->GetFormat()].BlockBytes;
 				}
 
+				// Distance, offsets and states each measured the irradiance texture
 				if (proxy->ProbesDistance)
 				{
 #if ENGINE_MAJOR_VERSION < 5
 					FRHITexture2D* texture = proxy->ProbesDistance->GetShaderResourceRHI()->GetTexture2D();
 #else
-					FRHITexture* texture = proxy->ProbesIrradiance->GetRHI();
+					FRHITexture* texture = proxy->ProbesDistance->GetRHI();
 #endif
 					if (texture)
 						info.distanceBytes = texture->GetSizeX() * texture->GetSizeY() * GPixelFormats[texture->GetFormat()].BlockBytes;
@@ -469,7 +475,7 @@ static bool MemoryUseExec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 #if ENGINE_MAJOR_VERSION < 5
 					FRHITexture2D* texture = proxy->ProbesOffsets->GetShaderResourceRHI()->GetTexture2D();
 #else
-					FRHITexture* texture = proxy->ProbesIrradiance->GetRHI();
+					FRHITexture* texture = proxy->ProbesOffsets->GetRHI();
 #endif
 					if (texture)
 						info.offsetsBytes = texture->GetSizeX() * texture->GetSizeY() * GPixelFormats[texture->GetFormat()].BlockBytes;
@@ -480,10 +486,22 @@ static bool MemoryUseExec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 #if ENGINE_MAJOR_VERSION < 5
 					FRHITexture2D* texture = proxy->ProbesStates->GetShaderResourceRHI()->GetTexture2D();
 #else
-					FRHITexture* texture = proxy->ProbesIrradiance->GetRHI();
+					FRHITexture* texture = proxy->ProbesStates->GetRHI();
 #endif
 					if (texture)
 						info.statesBytes = texture->GetSizeX() * texture->GetSizeY() * GPixelFormats[texture->GetFormat()].BlockBytes;
+				}
+
+				if (proxy->ProbesSpace)
+				{
+					if (FRHITexture* texture = proxy->ProbesSpace->GetRHI())
+						info.scrollSpaceBytes = texture->GetSizeX() * texture->GetSizeY() * GPixelFormats[texture->GetFormat()].BlockBytes;
+				}
+
+				if (proxy->ProbesVariability)
+				{
+					if (FRHITexture* texture = proxy->ProbesVariability->GetRHI())
+						info.variabilityBytes = texture->GetSizeX() * texture->GetSizeY() * GPixelFormats[texture->GetFormat()].BlockBytes;
 				}
 
 				memoryInfo.Push(info);
@@ -525,6 +543,8 @@ static bool MemoryUseExec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 		bytes += info.distanceBytes;
 		bytes += info.offsetsBytes;
 		bytes += info.statesBytes;
+		bytes += info.scrollSpaceBytes;
+		bytes += info.variabilityBytes;
 		totalBytes += bytes;
 
 		UE_LOG(LogConsoleResponse, Log, TEXT("  %s: %0.2f MB (%d B)"), (info.actor ? *info.actor->GetFullName() : *FString("<Unknown>")), float(bytes) / c_oneMegabyte, bytes);
@@ -533,6 +553,8 @@ static bool MemoryUseExec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 		UE_LOG(LogConsoleResponse, Log, TEXT("    Distance: %0.2f MB (%d B)"), float(info.distanceBytes) / c_oneMegabyte, info.distanceBytes);
 		UE_LOG(LogConsoleResponse, Log, TEXT("    Offsets: %0.2f MB (%d B)"), float(info.offsetsBytes) / c_oneMegabyte, info.offsetsBytes);
 		UE_LOG(LogConsoleResponse, Log, TEXT("    States: %0.2f MB (%d B)"), float(info.statesBytes) / c_oneMegabyte, info.statesBytes);
+		UE_LOG(LogConsoleResponse, Log, TEXT("    Scroll Space: %0.2f MB (%d B)"), float(info.scrollSpaceBytes) / c_oneMegabyte, info.scrollSpaceBytes);
+		UE_LOG(LogConsoleResponse, Log, TEXT("    Variability: %0.2f MB (%d B)"), float(info.variabilityBytes) / c_oneMegabyte, info.variabilityBytes);
 	}
 
 	UE_LOG(LogConsoleResponse, Log, TEXT("Total: %0.2f MB (%d B)"), float(totalBytes) / c_oneMegabyte, totalBytes);

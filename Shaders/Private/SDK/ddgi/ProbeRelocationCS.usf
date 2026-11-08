@@ -11,7 +11,6 @@
 #include "/Engine/Private/Common.ush"
 #include "ProbeCommon.ush"
 
-float   ProbeDistanceScale;
 int     ProbeIndexStart;
 int     ProbeIndexCount;
 
@@ -21,10 +20,16 @@ RWTexture2D<float4> DDGIVolumeRayDataUAV;
 // Probe offsets
 RWTexture2D<float4> DDGIVolumeProbeOffsetsUAV;
 
-[numthreads(8, 4, 1)]
-void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex)
+float DDGILoadProbeRayDistanceForRelocation(int2 rayTexCoord)
 {
-    // Compute the probe index for this thread
+    float4 rayData = DDGIVolumeRayDataUAV[rayTexCoord];
+    return (DDGIVolume.probeRayDataFormat != 0) ? rayData.a : rayData.g;
+}
+
+[numthreads(8, 4, 1)]
+void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+    // Compute the probe index for this thread (states/offsets layout)
     int probeIndex = DDGIGetProbeIndex(DispatchThreadID.xy, DDGIVolume.probeGridCounts);
 
     // Early out if the thread maps past the number of probes
@@ -42,11 +47,7 @@ void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Gr
             return;
     }
 
-#if RTXGI_DDGI_INFINITE_SCROLLING_VOLUME
     int storageProbeIndex = DDGIGetProbeIndexOffset(probeIndex, DDGIVolume.probeGridCounts, DDGIVolume.probeScrollOffsets);
-#else
-    int storageProbeIndex = probeIndex;
-#endif
     uint2 offsetTexelPosition = DDGIGetProbeTexelPosition(storageProbeIndex, DDGIVolume.probeGridCounts);
 
     // Get the current world position offset
@@ -70,22 +71,18 @@ void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Gr
         int2 rayTexCoord = int2(rayIndex, probeIndex);
 
         // Load the hit distance from the ray cast
-    #if (RTXGI_DDGI_FORMAT_RADIANCE == 1)
-        float hitDistance = DDGIVolumeRayDataUAV[rayTexCoord].a;
-    #else
-        float hitDistance = DDGIVolumeRayDataUAV[rayTexCoord].g;
-    #endif
+        float hitDistance = DDGILoadProbeRayDistanceForRelocation(rayTexCoord);
 
-        // Found a backface
         if (hitDistance < 0.f)
         {
+            // Found a backface
             backfaceCount++;
 
             // Negate the hit distance on a backface hit and scale back to the full distance
             hitDistance = hitDistance * -5.f;
             if (hitDistance < closestBackfaceDistance)
             {
-                // Make up for the shortening of backfaces
+                // Store the closest backface distance and ray index
                 closestBackfaceDistance = hitDistance;
                 closestBackfaceIndex = rayIndex;
             }
@@ -95,11 +92,13 @@ void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Gr
             // Found a frontface
             if (hitDistance < closestFrontfaceDistance)
             {
+                // Store the closest frontface distance and ray index
                 closestFrontfaceDistance = hitDistance;
                 closestFrontfaceIndex = rayIndex;
             }
             else if (hitDistance > farthestFrontfaceDistance)
             {
+                // Store the farthest frontface distance and ray index
                 farthestFrontfaceDistance = hitDistance;
                 farthestFrontfaceIndex = rayIndex;
             }
@@ -108,29 +107,31 @@ void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint Gr
 
     float3 fullOffset = float3(1e27f, 1e27f, 1e27f);
 
-    if (closestBackfaceIndex != -1 && (float(backfaceCount) / numRays) > DDGIVolume.probeBackfaceThreshold)
+    if (closestBackfaceIndex != -1 && (backfaceCount / float(numRays)) > DDGIVolume.probeFixedRayBackfaceThreshold)
     {
-        // If there is a close backface AND more than 25% of the hit geometry are backfacing, assume the probe is inside geometry
-        float3 closestBackfaceDirection = closestBackfaceDistance * normalize(DDGIGetProbeRayDirection(closestBackfaceIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform));
-        fullOffset = currentOffset + closestBackfaceDirection * (ProbeDistanceScale + 1.f);
+        // If at least one backface triangle is hit AND backfaces are hit by enough probe rays,
+        // assume the probe is inside geometry and move it outside of the geometry.
+        float3 closestBackfaceDirection = DDGIGetProbeRayDirection(closestBackfaceIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform);
+        fullOffset = currentOffset + (closestBackfaceDirection * (closestBackfaceDistance + DDGIVolume.probeMinFrontfaceDistance * 0.5f));
     }
     else if (closestFrontfaceDistance < DDGIVolume.probeMinFrontfaceDistance)
     {
-        // Don't move the probe if moving towards the farthest frontface will also bring us closer to the nearest frontface
-        float3 closestFrontfaceDirection = normalize(DDGIGetProbeRayDirection(closestFrontfaceIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform));
-        float3 farthestFrontfaceDirection = normalize(DDGIGetProbeRayDirection(farthestFrontfaceIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform));
-
-        if (dot(closestFrontfaceDirection, farthestFrontfaceDirection) <= 0.f)
+        // Don't move the probe if moving towards the farthest frontface will also bring us closer to the nearest frontface.
+        // (Guarded against a missing farthest frontface, which the SDK would read as ray -1.)
+        if (closestFrontfaceIndex != -1 && farthestFrontfaceIndex != -1)
         {
-            // Ensures the probe never moves through the farthest frontface
-            farthestFrontfaceDistance *= min(farthestFrontfaceDistance, 1.f);
+            float3 closestFrontfaceDirection = DDGIGetProbeRayDirection(closestFrontfaceIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform);
+            float3 farthestFrontfaceDirection = DDGIGetProbeRayDirection(farthestFrontfaceIndex, DDGIVolume.numRaysPerProbe, DDGIVolume.probeRayRotationTransform);
 
-            // ProbeDistanceScale decreases from 1.f - 0.f for backface movement
-            // It can go to 0 to ensure some movement away from close surfaces
-            fullOffset = currentOffset + farthestFrontfaceDirection * ProbeDistanceScale;
+            if (dot(closestFrontfaceDirection, farthestFrontfaceDirection) <= 0.f)
+            {
+                // Ensures the probe never moves through the farthest frontface
+                farthestFrontfaceDistance *= min(farthestFrontfaceDistance, 1.f);
+                fullOffset = currentOffset + farthestFrontfaceDirection;
+            }
         }
     }
-    else if (closestFrontfaceDistance > DDGIVolume.probeMinFrontfaceDistance + ProbeDistanceScale)
+    else if (closestFrontfaceDistance > DDGIVolume.probeMinFrontfaceDistance)
     {
         // Probe isn't near anything, try to move it back towards zero offset
         float moveBackMargin = min(closestFrontfaceDistance - DDGIVolume.probeMinFrontfaceDistance, length(currentOffset));

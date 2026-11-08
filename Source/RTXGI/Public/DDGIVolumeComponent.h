@@ -19,6 +19,7 @@
 #include "RHIResources.h"
 #include "RendererInterface.h"
 #include "Runtime/Launch/Resources/Version.h"
+#include "RHIGPUReadback.h"
 
 #include "DDGIUtilities.h"
 
@@ -64,6 +65,19 @@ enum class EDDGISkyLightType
 	RayTracing UMETA(DisplayName = "Ray Tracing")
 };
 
+// How a DDGIVolume behaves at runtime. 
+// Note: the ray-traced runtime update still only runs on the deferred renderer.
+UENUM()
+enum class EDDGIRuntimeMode : uint8
+{
+	// Update probes every frame via ray tracing (requires ray-tracing hardware + the deferred renderer).
+	Dynamic UMETA(DisplayName = "Dynamic (Runtime Ray Traced)"),
+	// Never update at runtime; always use the probe values baked when the level was saved.
+	Static UMETA(DisplayName = "Static (Baked)"),
+	// Update dynamically when ray tracing is available, otherwise fall back to the baked result.
+	StaticWhenNoRayTracing UMETA(DisplayName = "Dynamic, Static Fallback on Non-Ray-Tracing HW")
+};
+
 struct FDDGITexturePixels
 {
 	struct
@@ -89,6 +103,40 @@ struct FDDGITextureLoadContext
 	{
 		*this = FDDGITextureLoadContext();
 	}
+};
+
+// Render-thread state of a volume's Probe Variability. See DDGIProbeVariability.h.
+struct FDDGIProbeVariabilityState
+{
+	static constexpr int32 NumReadbackSlots = 4;
+
+	struct FReadbackSlot
+	{
+		TUniquePtr<FRHIGPUTextureReadback> Readback;
+		uint64 EnqueueFrame = 0;
+		uint32 Generation = 0;
+		// SweepsSinceReset when the reading was taken---convergence needs readings of a settled volume
+		float SweepsAtEnqueue = 0.0f;
+		bool bPending = false;
+	};
+
+	FReadbackSlot Slots[NumReadbackSlots];
+
+	// Bumped by every reset; readings from older generations are ignored
+	uint32 Generation = 1;
+
+	// Full probe sweeps blended since the last reset
+	float SweepsSinceReset = 0.0f;
+
+	// Last average coefficient of variation read back
+	float LastVariability = TNumericLimits<float>::Max();
+	float LastWeight = 0.0f;
+	bool bHasReadingForGeneration = false;
+
+	bool bConverged = false;
+
+	// Frame of the last measure-only check (staggered updates)
+	uint64 LastCheckFrame = 0;
 };
 
 class RTXGI_API FDDGIVolumeSceneProxy
@@ -147,11 +195,15 @@ public:
 		static const EPixelFormat c_pixelFormatIrradianceHighBitDepth = EPixelFormat::PF_A32B32G32R32F;
 		static const EPixelFormat c_pixelFormatDistanceHighBitDepth = EPixelFormat::PF_G32R32F;
 		static const EPixelFormat c_pixelFormatDistanceLowBitDepth = EPixelFormat::PF_G16R16F;
-		static const EPixelFormat c_pixelFormatOffsets = EPixelFormat::PF_A16B16G16R16;
+		static const EPixelFormat c_pixelFormatOffsets = EPixelFormat::PF_FloatRGBA;
+		static const EPixelFormat c_pixelFormatOffsetsLegacyUnorm = EPixelFormat::PF_A16B16G16R16;
 		static const EPixelFormat c_pixelFormatStates = EPixelFormat::PF_R8_UINT;
 
 		static const EPixelFormat c_pixelFormatScrollSpace = EPixelFormat::PF_R8_UINT;
 
+		// Interior irradiance texels
+		// R = coefficient of variation, G = weight
+		static const EPixelFormat c_pixelFormatVariability = EPixelFormat::PF_G16R16F;
 
 		// ProbeBlendingCS (.hlsl in SDK, .usf in plugin) needs this as a define so is a hard coded constant right now.
 		// We need that shader to not require that as a define. Then, we can make it a tuneable parameter on the volume.
@@ -181,7 +233,8 @@ public:
 		float ViewBias = 0.0f;
 		float BlendDistance = 0.0f;
 		float BlendDistanceBlack = 0.0f;
-		float ProbeBackfaceThreshold = 0.0f;
+		float ProbeBackfaceThreshold = 0.0f;			// fixed rays: relocation and classification
+		float ProbeRandomRayBackfaceThreshold = 0.1f;	// random rays: blending
 		float ProbeMinFrontfaceDistance = 0.0f;
 		bool EnableProbeRelocation = false;
 		bool EnableProbeScrolling = false;
@@ -191,9 +244,11 @@ public:
 		float IrradianceScalar = 1.0f;
 		float EmissiveMultiplier = 1.0f;
 		float LightingMultiplier = 1.0f;
-		bool RuntimeStatic = false; // If true, does not update during gameplay, only during editor.
+		EDDGIRuntimeMode RuntimeMode = EDDGIRuntimeMode::Dynamic; // Static / StaticWhenNoRayTracing = don't update during gameplay.
 		EDDGISkyLightType SkyLightTypeOnRayMiss = EDDGISkyLightType::Raster;
 		bool bForceUpdate = false;
+		bool EnableProbeVariability = false;
+		float VariabilityThreshold = 0.05f;
 	};
 	FComponentData ComponentData;
 	FDDGITextureLoadContext TextureLoadContext;
@@ -204,6 +259,17 @@ public:
 	TRefCountPtr<IPooledRenderTarget> ProbesStates;
 	TRefCountPtr<IPooledRenderTarget> ProbesSpace;
 
+	// Persistent variability atlas (only allocated while ComponentData.EnableProbeVariability) and its CPU-side state.
+	TRefCountPtr<IPooledRenderTarget> ProbesVariability;
+	FDDGIProbeVariabilityState VariabilityState;
+
+	// Set by the render command of every UpdateRenderThreadData (component edit, transform change, ISV scroll) and
+	// consumed by the per-frame update. Kept outside ComponentData so a later command cannot overwrite a pending reset.
+	bool bVariabilityResetRequested = true;
+
+	// Frame (FSceneViewFamily::FrameCounter) the scene's volumes were last updated, keyed like SceneRoundRobinValue.
+	// RenderDiffuseIndirectLight is broadcast per view; the ray-traced update must run once per frame, not per view.
+	static TMap<const void*, uint64> SceneLastUpdateFrameCounter;
 
 	// Where to start the probe update from, for updating a subset of probes
 	int ProbeIndexStart = 0;
@@ -285,6 +351,10 @@ struct FProbeRelocation
 	// Probe relocation and state classifier assume probes with more than this ratio of backface hits are inside of geometry.
 	UPROPERTY(EditAnywhere, Category = "GI Probes", meta = (ClampMin = "0", ClampMax = "1"));
 	float ProbeBackfaceThreshold = 0.25f;
+
+	// Probe blending skips a probe when more than this ratio of its random (blended) rays hit backfaces, assuming the probe is inside geometry. Applies whether or not relocation is enabled. The fixed-ray ratio above drives relocation and classification.
+	UPROPERTY(EditAnywhere, Category = "GI Probes", meta = (ClampMin = "0", ClampMax = "1"));
+	float ProbeRandomRayBackfaceThreshold = 0.1f;
 };
 
 UCLASS(HideCategories = (Tags, AssetUserData, Collision, Cooking, Transform, Rendering, Mobility, LOD))
@@ -297,6 +367,9 @@ protected:
 	void InitializeComponent() override final;
 
 	void Serialize(FArchive& Ar) override final;
+
+	// Migrates the deprecated bool RuntimeStatic to EDDGIRuntimeMode RuntimeMode for old assets.
+	virtual void PostLoad() override;
 
 	//~ Begin UActorComponent Interface
 	virtual bool ShouldCreateRenderState() const override { return true; }
@@ -350,9 +423,14 @@ public:
 	UPROPERTY(EditAnywhere, Category = "GI Volume");
 	float BlendingCutoffDistance = 0.0f;
 
-	// If true, the volume will not update at runtime, and will keep the lighting values seen when the level is saved.
+	// Controls whether the volume updates at runtime or uses the baked (level-save) probe values.
+	// Replaces the old bool RuntimeStatic (migrated in PostLoad). See EDDGIRuntimeMode.
 	UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "GI Volume");
-	bool RuntimeStatic = false;
+	EDDGIRuntimeMode RuntimeMode = EDDGIRuntimeMode::Dynamic;
+
+	// Deprecated: superseded by RuntimeMode. Retained so pre-existing assets load and migrate.
+	UPROPERTY();
+	bool RuntimeStatic_DEPRECATED = false;
 
 	UPROPERTY(meta=(DeprecatedProperty, DeprecationMessage = "not needed from blueprints"));
 	FVector LastOrigin_DEPRECATED;
@@ -408,6 +486,14 @@ public:
 	// texel's irradiance in a single update cycle.
 	UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "GI Probes");
 	float probeBrightnessThreshold = 2.0f;
+
+	// Track how much this volume's probe irradiance still changes between updates. Once the average coefficient of variation stays below Variability Threshold, the volume stops updating its probes (removing their ray tracing and blending cost and their low-frequency shimmer) and only runs a periodic check that wakes it when lighting or geometry changes. Light, sky and volume edits wake it immediately. Ray-traced (deferred) update only.
+	UPROPERTY(EditAnywhere, Category = "GI Probes|Variability");
+	bool bEnableProbeVariability = false;
+
+	// Average coefficient of variation below which the volume counts as converged. Scene dependent: NVIDIA's sample scenes use 0.02 to 0.4. Use the Probe Variability probe visualization (Project Settings > RTXGI) to tune it.
+	UPROPERTY(EditAnywhere, Category = "GI Probes|Variability", meta = (ClampMin = "0.0001", ClampMax = "10", EditCondition = "bEnableProbeVariability"));
+	float VariabilityThreshold = 0.05f;
 
 	// --- "GI Lighting" properties
 
@@ -512,7 +598,7 @@ public:
 
 	FIntVector PrevProbeScrollOffsets;
 
-	FIntVector PrevProbeCounts = FIntVector(8,8,8);
+	FIntVector PrevProbeCounts = FIntVector(8, 8, 8);
 
 #if ENGINE_MAJOR_VERSION < 5
 	FVector LastOrigin = FVector{ 0.0f, 0.0f, 0.0f };

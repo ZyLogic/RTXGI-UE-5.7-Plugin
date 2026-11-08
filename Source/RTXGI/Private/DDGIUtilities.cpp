@@ -9,6 +9,7 @@
 */
 
 #include "../Public/DDGIUtilities.h"
+#include "RHICommandList.h"
 
 //Implementation from FLatentGPUTimer from ScenePrivate.h / RendererScene.cpp
 FLatentGPUTimerDDGI::FLatentGPUTimerDDGI(FRenderQueryPoolRHIRef InTimerQueryPool)

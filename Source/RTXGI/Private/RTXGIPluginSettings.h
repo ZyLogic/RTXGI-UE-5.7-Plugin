@@ -13,13 +13,15 @@
 #include "CoreMinimal.h"
 #include "Engine/EngineTypes.h"
 #include "Engine/DeveloperSettings.h"
+#include "PixelFormat.h"
 #include "RTXGIPluginSettings.generated.h"
 
 UENUM()
 enum class EDDGIIrradianceBits : uint8
 {
 	n10 UMETA(DisplayName = "10 bit"),
-	n32 UMETA(DisplayName = "32 bit (for bright lighting and extended luminance range rendering)")
+	n32 UMETA(DisplayName = "32 bit (for bright lighting and extended luminance range rendering)"),
+	n16 UMETA(DisplayName = "16 bit float (extended luminance range, half the memory of 32 bit)")
 };
 
 UENUM()
@@ -34,9 +36,29 @@ enum class EDDGIProbesVisulizationMode : uint8
 {
 	off UMETA(DisplayName = "Off"),
 	irrad UMETA(DisplayName = "Irradiance"),
-	distr UMETA(DisplayName = "Squared Hit Distance"),
-	distg UMETA(DisplayName = "Hit Distance")
+	distr UMETA(DisplayName = "Hit Distance"),
+	distg UMETA(DisplayName = "Squared Hit Distance"),
+	variability UMETA(DisplayName = "Probe Variability")
 };
+
+// Pixel format of the probe irradiance atlas for a bit-depth setting.
+inline EPixelFormat GetDDGIIrradiancePixelFormat(EDDGIIrradianceBits Bits)
+{
+	switch (Bits)
+	{
+	case EDDGIIrradianceBits::n32: return PF_A32B32G32R32F;
+	case EDDGIIrradianceBits::n16: return PF_FloatRGBA;
+	default: return PF_A2B10G10R10;
+	}
+}
+
+// taken from the sdk directly
+// 10-bit UNORM irradiance boost by 1.0989 energy boost on sampling, packed (F32x2) ray data. 
+// everything else is expressed in floats instead
+inline bool IsDDGIIrradianceLowBitDepth(EDDGIIrradianceBits Bits)
+{
+	return Bits == EDDGIIrradianceBits::n10;
+}
 
 /**
  * Configure the RTXGI plug-in.
@@ -58,8 +80,9 @@ public:
 #endif
 
 	/** Light clipping can occur when lighting values are too large due to bright lights or extended radiance.
-	* With 10-bits texture format, clipping can be componsated through the irradiance scalar parameter on the DDGI volume.
-	* 32-bit texture format shows no clipping but with higher memory cost and slower updates.
+	* With 10-bits texture format, clipping can be compensated through the irradiance scalar parameter on the DDGI volume.
+	* 16-bit float format shows no clipping at half the memory of 32-bit. 32-bit texture format shows no clipping but with
+	* higher memory cost and slower updates. Float formats also trace with full precision ray radiance.
 	*/
 	UPROPERTY(config, EditAnywhere, Category=DDGI)
 	EDDGIIrradianceBits IrradianceBits = EDDGIIrradianceBits::n10;

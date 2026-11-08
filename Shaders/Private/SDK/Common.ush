@@ -102,4 +102,14 @@ float4 RTXGIQuaternionConjugate(float4 q)
     return float4(-q.xyz, q.w);
 }
 
+/**
+* Convert linear rgb to luminance
+* This is used by the probe brightness threshold and probe variability
+*/
+float RTXGILinearRGBToLuminance(float3 rgb)
+{
+    const float3 LuminanceWeights = float3(0.2126, 0.7152, 0.0722);
+    return dot(rgb, LuminanceWeights);
+}
+
 #endif // RTXGI_COMMON_HLSL

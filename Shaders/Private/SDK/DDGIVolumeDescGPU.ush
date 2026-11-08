@@ -14,6 +14,7 @@
 /**
  * DDGIVolumeDescGPU
  * The condensed DDGIVolume descriptor for use on the GPU.
+ * Must list the same members as the C++ uniform buffer FDDGIVolumeDescGPU.
  */
 struct DDGIVolumeDescGPU
 {
@@ -38,8 +39,14 @@ struct DDGIVolumeDescGPU
     int         volumeMovementType;
     int3        probeScrollOffsets;
 
-    float       probeBackfaceThreshold;
+    float       probeRandomRayBackfaceThreshold;
+    float       probeFixedRayBackfaceThreshold;
     float       probeMinFrontfaceDistance;
+
+    int         probeRelocationEnabled;     // 1: probe offsets texture is valid and used
+    int         probeRayDataFormat;         // 0: F32x2 (radiance packed R10G10B10 in R), 1: F32x4
+    int         probeIrradianceFormat;      // 0: R10G10B10A2 UNORM (1.0989 energy boost applies), 1: float (16 or 32 bit)
+    int         probeVariabilityEnabled;    // 1: the irradiance blend writes the coefficient of variation
 };
 
 #endif // RTXGI_DDGI_VOLUME_DESC_GPU_H
